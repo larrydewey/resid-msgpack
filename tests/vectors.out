@@ -1,0 +1,62 @@
+ok   nil
+ok   false
+ok   true
+ok   pos/0
+ok   pos/1
+ok   pos/127
+ok   pos/128
+ok   pos/255
+ok   pos/256
+ok   pos/65535
+ok   pos/65536
+ok   pos/4294967295
+ok   pos/4294967296
+ok   u64 max
+ok   neg/-1
+ok   neg/-32
+ok   neg/-33
+ok   neg/-128
+ok   neg/-129
+ok   neg/-32768
+ok   neg/-32769
+ok   neg/-1000000
+ok   i128/in range
+ok   i128/big
+ok   i128/big negative
+ok   i128/min
+ok   u128/big
+ok   float/1.5
+ok   float/1.0
+ok   float/wide
+ok   float/negative
+ok   str/empty
+ok   str/one
+ok   str/IETF
+ok   str/utf8
+ok   bin/empty
+ok   bin/three
+ok   array/empty
+ok   array/three
+ok   array/nested
+ok   d/nil
+ok   d/0
+ok   d/127
+ok   d/128
+ok   d/65536
+ok   d/u64 as Int
+ok   d/-1
+ok   d/-33
+ok   d/-1000000
+ok   d/1.5
+ok   d/0.1
+ok   d/empty str
+ok   d/IETF
+ok   d/utf8
+ok   d/binary
+ok   d/array
+ok   d/array16 two
+ok   d/bignum
+ok   d/bignum negative
+ok   d/min
+ok   d/u128
+exit 0

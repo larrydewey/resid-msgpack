@@ -1,0 +1,149 @@
+// vectors.resid — the encodings the MessagePack specification tabulates,
+// written and read back.
+
+import "../src/msgpack.resid";
+import "check.resid";
+
+Str hex(Result(Str, SerialError) r) {
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(s) = r) { return s; }
+    return "unreachable";
+}
+
+Bool enc_is(Str name, Str want, Int x) { return check_text(name, hex(to_msgpack_hex(x)), want); }
+
+Str dec_int(Str text) {
+    Result(Int, SerialError) r = from_msgpack_hex(text);
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return f"{v}"; }
+    return "unreachable";
+}
+
+Str dec_str(Str text) {
+    Result(Str, SerialError) r = from_msgpack_hex(text);
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return v; }
+    return "unreachable";
+}
+
+Str dec_float(Str text) {
+    Result(Float, SerialError) r = from_msgpack_hex(text);
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return f"{v}"; }
+    return "unreachable";
+}
+
+Str dec_list(Str text) {
+    Result(List(Int), SerialError) r = from_msgpack_hex(text);
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return f"{v}"; }
+    return "unreachable";
+}
+
+Str dec_bytes(Str text) {
+    Result(ByteBuf, SerialError) r = from_msgpack_hex(text);
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return msgpack_to_hex(v.bytes); }
+    return "unreachable";
+}
+
+Str big(Result(Int(128), SerialError) r) {
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return f"{v}"; }
+    return "unreachable";
+}
+
+Str ubig(Result(UInt(128), SerialError) r) {
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(v) = r) { return f"{v}"; }
+    return "unreachable";
+}
+
+Int main() {
+    // ─── Encoding ──────────────────────────────────────────────────────
+    check_text("nil", hex(to_msgpack_hex(unit())), "c0");
+    check_text("false", hex(to_msgpack_hex(false)), "c2");
+    check_text("true", hex(to_msgpack_hex(true)), "c3");
+
+    // Positive integers: one byte folded up to 127, then widths.
+    enc_is("pos/0", "00", 0);
+    enc_is("pos/1", "01", 1);
+    enc_is("pos/127", "7f", 127);
+    enc_is("pos/128", "cc80", 128);
+    enc_is("pos/255", "ccff", 255);
+    enc_is("pos/256", "cd0100", 256);
+    enc_is("pos/65535", "cdffff", 65535);
+    enc_is("pos/65536", "ce00010000", 65536);
+    enc_is("pos/4294967295", "ceffffffff", 4294967295);
+    enc_is("pos/4294967296", "cf0000000100000000", 4294967296);
+    check_text("u64 max", hex(to_msgpack_hex(u64(18446744073709551615))), "cfffffffffffffffff");
+
+    // Negative integers: one byte folded to -32, then widths.
+    enc_is("neg/-1", "ff", 0 - 1);
+    enc_is("neg/-32", "e0", 0 - 32);
+    enc_is("neg/-33", "d0df", 0 - 33);
+    enc_is("neg/-128", "d080", 0 - 128);
+    enc_is("neg/-129", "d1ff7f", 0 - 129);
+    enc_is("neg/-32768", "d18000", 0 - 32768);
+    enc_is("neg/-32769", "d2ffff7fff", 0 - 32769);
+    enc_is("neg/-1000000", "d2fff0bdc0", 0 - 1000000);
+
+    // 128-bit integers: the plain forms while they fit, then the extension
+    // slot carrying the magnitude's bytes.
+    check_text("i128/in range", hex(to_msgpack_hex(i128(0) - i128(1000))), "d1fc18");
+    check_text("i128/big", hex(to_msgpack_hex(i128(170141183460469231731687303715884105727))), "d8027fffffffffffffffffffffffffffffff");
+    check_text("i128/big negative", hex(to_msgpack_hex(i128(0) - i128(170141183460469231731687303715884105727))), "d8037ffffffffffffffffffffffffffffffe");
+    // The smallest Int(128) has no positive counterpart, so its magnitude
+    // is spelled out rather than negated.
+    Int(128) min_i128 = i128(0) - i128(170141183460469231731687303715884105727) - i128(1);
+    check_text("i128/min", hex(to_msgpack_hex(min_i128)), "d8037fffffffffffffffffffffffffffffff");
+    check_text("u128/big", hex(to_msgpack_hex(u128(340282366920938463463374607431768211455))), "d802ffffffffffffffffffffffffffffffff");
+
+    // Floats: 32-bit when it reads back exactly, else 64-bit.
+    check_text("float/1.5", hex(to_msgpack_hex(1.5)), "ca3fc00000");
+    check_text("float/1.0", hex(to_msgpack_hex(1.0)), "ca3f800000");
+    check_text("float/wide", hex(to_msgpack_hex(0.1)), "cb3fb999999999999a");
+    check_text("float/negative", hex(to_msgpack_hex(0.0 - 4.1)), "cbc010666666666666");
+
+    // Strings and binary, by length.
+    check_text("str/empty", hex(to_msgpack_hex("")), "d900");
+    check_text("str/one", hex(to_msgpack_hex("a")), "d90161");
+    check_text("str/IETF", hex(to_msgpack_hex("IETF")), "d90449455446");
+    check_text("str/utf8", hex(to_msgpack_hex("ü")), "d902c3bc");
+    List(Int) nobytes = [];
+    check_text("bin/empty", hex(to_msgpack_hex(byte_buf(nobytes))), "c400");
+    check_text("bin/three", hex(to_msgpack_hex(byte_buf([1, 2, 3]))), "c403010203");
+
+    // Arrays and maps: 16 bits at least.
+    List(Int) empty = [];
+    check_text("array/empty", hex(to_msgpack_hex(empty)), "dc0000");
+    List(Int) nums = [1, 2, 3];
+    check_text("array/three", hex(to_msgpack_hex(nums)), "dc0003010203");
+    List(List(Int)) nested = [[1], [2, 3]];
+    check_text("array/nested", hex(to_msgpack_hex(nested)), "dc0002dc000101dc00020203");
+
+    // ─── Decoding ──────────────────────────────────────────────────────
+    check_text("d/nil", dec_int("c0"), "invalid type: expected an integer, found null");
+    check_text("d/0", dec_int("00"), "0");
+    check_text("d/127", dec_int("7f"), "127");
+    check_text("d/128", dec_int("cc80"), "128");
+    check_text("d/65536", dec_int("ce00010000"), "65536");
+    check_text("d/u64 as Int", dec_int("cfffffffffffffffff"), "invalid value 18446744073709551615, expected an Int");
+    check_text("d/-1", dec_int("ff"), "-1");
+    check_text("d/-33", dec_int("d0df"), "-33");
+    check_text("d/-1000000", dec_int("d2fff0bdc0"), "-1000000");
+    check_text("d/1.5", dec_float("ca3fc00000"), "1.5");
+    check_text("d/0.1", dec_float("cb3fb999999999999a"), "0.1");
+    check_text("d/empty str", dec_str("d900"), "");
+    check_text("d/IETF", dec_str("d90449455446"), "IETF");
+    check_text("d/utf8", dec_str("d902c3bc"), "ü");
+    check_text("d/binary", dec_bytes("c403010203"), "010203");
+    check_text("d/array", dec_list("dc0003010203"), "[1, 2, 3]");
+    check_text("d/array16 two", dec_list("dc00020102"), "[1, 2]");
+    check_text("d/bignum", big(from_msgpack_hex("d8027fffffffffffffffffffffffffffffff")), "170141183460469231731687303715884105727");
+    check_text("d/bignum negative", big(from_msgpack_hex("d8037ffffffffffffffffffffffffffffffe")), "-170141183460469231731687303715884105727");
+    check_text("d/min", big(from_msgpack_hex("d8037fffffffffffffffffffffffffffffff")), "-170141183460469231731687303715884105728");
+    check_text("d/u128", ubig(from_msgpack_hex("d802ffffffffffffffffffffffffffffffff")), "340282366920938463463374607431768211455");
+
+    return 0;
+}

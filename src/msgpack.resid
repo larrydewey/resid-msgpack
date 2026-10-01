@@ -1,0 +1,844 @@
+// msgpack.resid — MessagePack as a format for resid-serial.
+//
+// A MessagePack encoder state is the bytes written so far, newest first,
+// so every write is O(1) and `msgpack_bytes` reverses them once at the
+// end. The protocol is prefix-free and every container says its own
+// length, so the decoder only needs a stack of what each open container
+// has left.
+//
+// Representation choices, all of which round-trip through this package:
+//
+//   struct          a map with the field names as str keys
+//   variant         a unit variant is its name as a str, a variant with a
+//                   payload is a one-entry map {name: payload}
+//   option          None is nil, Some(v) is v
+//   unit            nil
+//   bytes           bin
+//   Int(128)        an ext (type 2 or 3, MessagePack's extension slot)
+//                   wrapping the magnitude's big-endian bytes when it does
+//                   not fit in 64 bits, otherwise the plain int form
+//   Float           32-bit when that reads back exactly, else 64-bit;
+//                   NaN and infinity have their own encodings here, so they
+//                   are written rather than refused
+
+import "../../resid-serial/src/serial.resid";
+import "pack.resid";
+
+// ─── The encoder ─────────────────────────────────────────────────────
+
+type MpOut = MpNil | MpCons(MpCell);
+type MpCell = { MpOut next; Int b; };
+
+type MsgpackEnc = { MpOut out; };
+
+pub MsgpackEnc msgpack_encoder() { return MsgpackEnc {.out = MpNil}; }
+
+// The bytes written, oldest first. Consumes the state.
+pub List(Int) msgpack_bytes(MsgpackEnc e) { return mp_out_list(e.out, ListBuf()); }
+
+pub List(Int) mp_out_list(MpOut o, ListBuf(Int) b) {
+    return match o { MpNil => b.finish().reverse(), MpCons(c) => mp_out_list(c.next, b.push(c.b)) };
+}
+
+MsgpackEnc mp_push(MsgpackEnc e, Int b) {
+    MpCell c = MpCell {.next = e.out, .b = b};
+    return MsgpackEnc {.out = MpCons(c)};
+}
+
+MsgpackEnc mp_push_all(MsgpackEnc e, List(Int) bs, Int i) {
+    if (i >= bs.len()) { return e; }
+    return mp_push_all(mp_push(e, bs[i]), bs, i + 1);
+}
+
+// A str carrying a string's own bytes: a field name, a map key, or a
+// string value.
+MsgpackEnc mp_text(MsgpackEnc e, Str key) {
+    List(Int) bytes = mp_str_bytes(key);
+    Int n = bytes.len();
+    return mp_push_all(mp_push_all(e, mp_len_header(n, mp_str8(), mp_str16(), mp_str32(), mp_str32()), 0), bytes, 0);
+}
+
+// Arrays and maps have no short form: 16 bits at least.
+MsgpackEnc mp_count_header(MsgpackEnc e, Int n, Int two, Int four) {
+    if (n < 65536) { return mp_push_all(mp_push(e, two), mp_int2(n), 0); }
+    return mp_push_all(mp_push_all(mp_push(e, four), mp_u4((UInt(64))n), 0), [], 0);
+}
+
+Result(MsgpackEnc, SerialError) me_unit(MsgpackEnc e) { return Ok(mp_push(e, mp_nil())); }
+
+Result(MsgpackEnc, SerialError) me_bool(MsgpackEnc e, Bool v) { return Ok(mp_push(e, if (v) { mp_true() } else { mp_false() })); }
+
+// Positive integers start folded into one byte; wider ones name their
+// width. Negative ones start at -32.
+Result(MsgpackEnc, SerialError) me_int(MsgpackEnc e, Int v) {
+    if (v >= 0) { return me_uint(e, (UInt(64))v); }
+    if (v >= 0 - 32) { return Ok(mp_push(e, 256 + v)); }
+    Int w = if (v >= 0 - 128) { 1 } else { if (v >= 0 - 32768) { 2 } else { if (v >= 0 - 2147483648) { 4 } else { 8 } } };
+    if (w == 1) { return Ok(mp_push_all(mp_push(e, mp_int8()), mp_int1(v), 0)); }
+    if (w == 2) { return Ok(mp_push_all(mp_push(e, mp_int16()), mp_int2(v), 0)); }
+    if (w == 4) { return Ok(mp_push_all(mp_push(e, mp_int32()), mp_int4(v), 0)); }
+    return Ok(mp_push_all(mp_push(e, mp_int64()), mp_int_bytes(v, 8, 0, []), 0));
+}
+
+Result(MsgpackEnc, SerialError) me_uint(MsgpackEnc e, UInt(64) v) {
+    if (v <= u64(127)) { return Ok(mp_push(e, (Int)v)); }
+    if (v <= u64(255)) { return Ok(mp_push_all(mp_push(e, mp_uint8()), mp_int1((Int)v), 0)); }
+    if (v <= u64(65535)) { return Ok(mp_push_all(mp_push(e, mp_uint16()), mp_int2((Int)v), 0)); }
+    if (v <= u64(4294967295)) { return Ok(mp_push_all(mp_push(e, mp_uint32()), mp_u4(v), 0)); }
+    return Ok(mp_push_all(mp_push(e, mp_uint64()), mp_u8(v), 0));
+}
+
+// 128-bit integers ride the plain forms while they fit, and take the
+// extension slot past that: type 2 for a positive magnitude, 3 for a
+// negative one.
+Result(MsgpackEnc, SerialError) me_i128(MsgpackEnc e, Int(128) v) {
+    if (v >= 0) {
+        UInt(128) u = u128(v);
+        if (u <= u128(18446744073709551615)) { return me_uint(e, (UInt(64))u); }
+        return Ok(mp_push_all(e, mp_bignum(false, u), 0));
+    }
+    UInt(128) mag = mp_mag128(v);
+    if (mag < u128(18446744073709551615)) { return me_int(e, 0 - (Int)mag - 1); }
+    return Ok(mp_push_all(e, mp_bignum(true, mag), 0));
+}
+
+Result(MsgpackEnc, SerialError) me_u128(MsgpackEnc e, UInt(128) v) {
+    if (v <= u128(18446744073709551615)) { return me_uint(e, (UInt(64))v); }
+    return Ok(mp_push_all(e, mp_bignum(false, v), 0));
+}
+
+pub UInt(128) mp_mag128(Int(128) v) {
+    // -2^127 has no positive counterpart in Int(128), so its magnitude is
+    // spelled out rather than negated.
+    if (v == i128(0) - i128(170141183460469231731687303715884105727) - i128(1)) { return u128(170141183460469231731687303715884105727); }
+    UInt(128) abs = u128(i128(0) - v);
+    return abs - u128(1);
+}
+
+// An ext carrying a magnitude's bytes: the type byte, then the data.
+pub List(Int) mp_bignum(Bool negative, UInt(128) magnitude) {
+    List(Int) be = mp_be16(magnitude);
+    Int start = mp_first_set(be, 0);
+    List(Int) body = be[start..be.len()];
+    List(Int) trimmed = if (body.len() == 0) { [0] } else { body };
+    Int n = trimmed.len();
+    List(Int) type = [if (negative) { 3 } else { 2 }];
+    // fixext1, 2, 4, 8 or 16 covers the widths a magnitude takes; ext8 is
+    // the fallback.
+    if (n == 1) { return mp_push_list(mp_int1(mp_fixext1()), type, trimmed); }
+    if (n == 2) { return mp_push_list(mp_int1(mp_fixext2()), type, trimmed); }
+    if (n == 4) { return mp_push_list(mp_int1(mp_fixext4()), type, trimmed); }
+    if (n == 8) { return mp_push_list(mp_int1(mp_fixext8()), type, trimmed); }
+    if (n == 16) { return mp_push_list(mp_int1(mp_fixext16()), type, trimmed); }
+    return mp_push_list(mp_int1(mp_ext8()).concat(mp_int1(n)), type, trimmed);
+}
+
+List(Int) mp_push_list(List(Int) a, List(Int) b, List(Int) c) { return a.concat(b).concat(c); }
+
+pub List(Int) mp_be16(UInt(128) v) { return mp_rev(mp_be16_at(v, 16, []), 0, []); }
+
+pub List(Int) mp_be16_at(UInt(128) v, Int n, List(Int) acc) {
+    if (n <= 0) { return acc; }
+    UInt(128) q = v / u128(256);
+    return mp_be16_at(q, n - 1, acc.concat([(Int)(v - q * u128(256))]));
+}
+
+pub Int mp_first_set(List(Int) full, Int i) {
+    if (i >= full.len() - 1) { return i; }
+    if (full[i] == 0) { return mp_first_set(full, i + 1); }
+    return i;
+}
+
+// 32-bit when the value survives the narrowing, else 64-bit.
+Result(MsgpackEnc, SerialError) me_float(MsgpackEnc e, Float v) {
+    if (mp_fits_f32(v)) { return Ok(mp_push_all(mp_push(e, mp_float32()), mp_f32_bits(f32(v)), 0)); }
+    return Ok(mp_push_all(mp_push(e, mp_float64()), mp_f64_bits(v), 0));
+}
+
+Result(MsgpackEnc, SerialError) me_str(MsgpackEnc e, Str v) { return Ok(mp_text(e, v)); }
+
+Result(MsgpackEnc, SerialError) me_bytes(MsgpackEnc e, List(Int) v) {
+    Int n = v.len();
+    return Ok(mp_push_all(mp_push_all(e, mp_len_header(n, mp_bin8(), mp_bin16(), mp_bin32(), mp_bin32()), 0), v, 0));
+}
+
+// A streamed string was promised its byte length up front, so its header
+// goes before the first code point.
+Result(MsgpackEnc, SerialError) me_str_begin(MsgpackEnc e, Int chars, Int bytes) { return Ok(mp_push_all(e, mp_len_header(bytes, mp_str8(), mp_str16(), mp_str32(), mp_str32()), 0)); }
+
+Result(MsgpackEnc, SerialError) me_str_char(MsgpackEnc e, Int cp) { return Ok(mp_push_all(e, mp_cp_bytes(cp), 0)); }
+
+Result(MsgpackEnc, SerialError) me_str_end(MsgpackEnc e) { return Ok(e); }
+
+Result(MsgpackEnc, SerialError) me_bytes_begin(MsgpackEnc e, Int len) { return Ok(mp_push_all(e, mp_len_header(len, mp_bin8(), mp_bin16(), mp_bin32(), mp_bin32()), 0)); }
+
+Result(MsgpackEnc, SerialError) me_byte(MsgpackEnc e, Int b) { return Ok(mp_push(e, b)); }
+
+Result(MsgpackEnc, SerialError) me_bytes_end(MsgpackEnc e) { return Ok(e); }
+
+// None is nil and Some(v) is v: an option is the value itself.
+Result(MsgpackEnc, SerialError) me_none(MsgpackEnc e) { return Ok(mp_push(e, mp_nil())); }
+
+Result(MsgpackEnc, SerialError) me_some(MsgpackEnc e) { return Ok(e); }
+
+Result(MsgpackEnc, SerialError) me_seq_begin(MsgpackEnc e, Int len) { return Ok(mp_count_header(e, len, mp_array16(), mp_array32())); }
+
+Result(MsgpackEnc, SerialError) me_seq_elem(MsgpackEnc e) { return Ok(e); }
+
+Result(MsgpackEnc, SerialError) me_seq_end(MsgpackEnc e) { return Ok(e); }
+
+Result(MsgpackEnc, SerialError) me_map_begin(MsgpackEnc e, Int len) { return Ok(mp_count_header(e, len, mp_map16(), mp_map32())); }
+
+Result(MsgpackEnc, SerialError) me_map_key(MsgpackEnc e) { return Ok(e); }
+
+Result(MsgpackEnc, SerialError) me_map_value(MsgpackEnc e) { return Ok(e); }
+
+Result(MsgpackEnc, SerialError) me_map_end(MsgpackEnc e) { return Ok(e); }
+
+// A struct is a map; its name is not stored, since the field names are.
+Result(MsgpackEnc, SerialError) me_struct_begin(MsgpackEnc e, Str name, Int len) { return Ok(mp_count_header(e, len, mp_map16(), mp_map32())); }
+
+Result(MsgpackEnc, SerialError) me_field(MsgpackEnc e, Str key) { return Ok(mp_text(e, key)); }
+
+Result(MsgpackEnc, SerialError) me_struct_end(MsgpackEnc e) { return Ok(e); }
+
+Result(MsgpackEnc, SerialError) me_unit_variant(MsgpackEnc e, Str enum_name, Int index, Str variant) { return Ok(mp_text(e, variant)); }
+
+Result(MsgpackEnc, SerialError) me_variant_begin(MsgpackEnc e, Str enum_name, Int index, Str variant) { return Ok(mp_text(mp_count_header(e, 1, mp_map16(), mp_map32()), variant)); }
+
+Result(MsgpackEnc, SerialError) me_variant_end(MsgpackEnc e) { return Ok(e); }
+
+Bool me_human(MsgpackEnc e) { return false; }
+
+Encoder(MsgpackEnc) = {
+    .write_unit = me_unit, .write_bool = me_bool, .write_int = me_int, .write_uint = me_uint,
+    .write_i128 = me_i128, .write_u128 = me_u128,
+    .write_float = me_float, .write_str = me_str, .write_bytes = me_bytes, .write_none = me_none,
+    .write_str_begin = me_str_begin, .write_str_char = me_str_char, .write_str_end = me_str_end,
+    .write_bytes_begin = me_bytes_begin, .write_byte = me_byte, .write_bytes_end = me_bytes_end,
+    .write_some = me_some, .write_seq_begin = me_seq_begin, .write_seq_elem = me_seq_elem, .write_seq_end = me_seq_end,
+    .write_map_begin = me_map_begin, .write_map_key = me_map_key, .write_map_value = me_map_value, .write_map_end = me_map_end,
+    .write_struct_begin = me_struct_begin, .write_field = me_field, .write_struct_end = me_struct_end,
+    .write_unit_variant = me_unit_variant, .write_variant_begin = me_variant_begin, .write_variant_end = me_variant_end,
+    .encodes_human_readable = me_human
+};
+
+@needs(Encode(T, MsgpackEnc))
+pub Result(List(Int), SerialError) to_msgpack(T x) {
+    MsgpackEnc e = encode(x, msgpack_encoder())?;
+    return Ok(msgpack_bytes(e));
+}
+
+@needs(Encode(T, MsgpackEnc))
+pub Result(Str, SerialError) to_msgpack_hex(T x) {
+    MsgpackEnc e = encode(x, msgpack_encoder())?;
+    return Ok(mp_hex(msgpack_bytes(e)));
+}
+
+// ─── The decoder ─────────────────────────────────────────────────────
+
+// An open container and the parts it has left: bytes for a str or a bin,
+// entries for an array or a map. MessagePack has no indefinite form, so
+// every frame counts down to zero.
+type MpFrame = MpArr(Int) | MpMap(Int) | MpStr(Int) | MpBin(Int);
+
+type MsgpackDec = {
+    List(Int) in;
+    Int pos;
+    List(MpFrame) open;
+    Int payloads;
+    Int vmaps;
+};
+
+pub MsgpackDec msgpack_decoder(List(Int) bs) {
+    List(MpFrame) none = [];
+    return MsgpackDec {.in = bs, .pos = 0, .open = none, .payloads = 0, .vmaps = 0};
+}
+
+MsgpackDec md_at(MsgpackDec d, Int pos, List(MpFrame) open) { return MsgpackDec {.in = d.in, .pos = pos, .open = open, .payloads = d.payloads, .vmaps = d.vmaps}; }
+
+MsgpackDec md_push(MsgpackDec d, MpFrame f) { return md_at(d, d.pos, d.open.concat([f])); }
+
+MsgpackDec md_pop(MsgpackDec d) {
+    Int k = d.open.len();
+    if (k == 0) { return d; }
+    return md_at(d, d.pos, d.open[0..k - 1]);
+}
+
+MsgpackDec md_take(MsgpackDec d, Int n) { return md_at(d, d.pos + n, d.open); }
+
+MsgpackDec md_set_left(MsgpackDec d, Int n) {
+    Int k = d.open.len();
+    if (k == 0) { return d; }
+    MpFrame f = d.open[k - 1];
+    MpFrame moved = match f {
+        MpArr(x) => MpArr(n),
+        MpMap(x) => MpMap(n),
+        MpStr(x) => MpStr(n),
+        MpBin(x) => MpBin(n)
+    };
+    return md_at(d, d.pos, d.open[0..k - 1].concat([moved]));
+}
+
+// How many parts the top frame has left, when it is the kind the caller
+// expects: 4 array, 5 map, 3 str, 2 bin.
+type MpLeft = { Int n; Bool ok; Str why; };
+
+MpLeft ml_miss(Str why) { return MpLeft {.n = 0, .ok = false, .why = why}; }
+
+MpLeft md_left(MsgpackDec d, Int kind) {
+    Int k = d.open.len();
+    if (k == 0) { return ml_miss("no container is open"); }
+    MpFrame f = d.open[k - 1];
+    return match f {
+        MpArr(x) => if (kind == 4) { MpLeft {.n = x, .ok = true, .why = ""} } else { ml_miss("no array is open") },
+        MpMap(x) => if (kind == 5) { MpLeft {.n = x, .ok = true, .why = ""} } else { ml_miss("no map is open") },
+        MpStr(x) => if (kind == 3) { MpLeft {.n = x, .ok = true, .why = ""} } else { ml_miss("no string is open") },
+        MpBin(x) => if (kind == 2) { MpLeft {.n = x, .ok = true, .why = ""} } else { ml_miss("no byte string is open") }
+    };
+}
+
+// ─── Type bytes ──────────────────────────────────────────────────────
+
+// One byte, read: the type of what comes next.
+Result(Parsed(Int, MsgpackDec), SerialError) md_type(MsgpackDec d, Str what) {
+    if (d.pos >= d.in.len()) { return Err(eof_error(what)); }
+    return parsed(d.in[d.pos], md_take(d, 1));
+}
+
+// `n` payload bytes, as a plain integer.
+Result(Parsed(Int, MsgpackDec), SerialError) md_small(MsgpackDec d, Int n, Str what) {
+    if (d.pos + n > d.in.len()) { return Err(eof_error(what)); }
+    Int v = mp_read_int(d.in, d.pos, n);
+    return parsed(v, md_take(d, n));
+}
+
+pub Int mp_read_int(List(Int) bs, Int i, Int n) {
+    if (n <= 1) { return bs[i]; }
+    return mp_read_wide_at(bs, i, i + n, 0);
+}
+
+Int mp_read_wide_at(List(Int) bs, Int i, Int end, Int acc) {
+    if (i >= end) { return acc; }
+    return mp_read_wide_at(bs, i + 1, end, (acc << 8) | bs[i]);
+}
+
+// `n` payload bytes as a width-tagged integer.
+Result(Parsed(UInt(64), MsgpackDec), SerialError) md_wide(MsgpackDec d, Int n, Str what) {
+    if (d.pos + n > d.in.len()) { return Err(eof_error(what)); }
+    UInt(64) v = mp_read_u64(d.in, d.pos, n);
+    return parsed(v, md_take(d, n));
+}
+
+UInt(64) mp_read_u64(List(Int) bs, Int i, Int n) { return mp_read_u64_at(bs, i, i + n, u64(0)); }
+
+UInt(64) mp_read_u64_at(List(Int) bs, Int i, Int end, UInt(64) acc) {
+    if (i >= end) { return acc; }
+    return mp_read_u64_at(bs, i + 1, end, (acc << 8) | (UInt(64))bs[i]);
+}
+
+// An ext: its type byte and its data.
+type MpExt = { Int kind; List(Int) data; };
+
+Result(Parsed(MpExt, MsgpackDec), SerialError) md_ext(MsgpackDec d) {
+    Parsed(Int, MsgpackDec) t = md_type(d, "an extension")?;
+    return md_ext_with(t.rest, t.value);
+}
+
+// An ext whose type byte has already been read.
+Result(Parsed(MpExt, MsgpackDec), SerialError) md_ext_with(MsgpackDec d, Int b) {
+    Int n = mp_ext_len(b);
+    if (n >= 0) { return md_ext_bytes(d, n); }
+    if (b == mp_ext8() || b == mp_ext16() || b == mp_ext32()) {
+        Int w = if (b == mp_ext8()) { 1 } else { if (b == mp_ext16()) { 2 } else { 4 } };
+        Parsed(Int, MsgpackDec) len = md_small(d, w, "an extension")?;
+        return md_ext_bytes(len.rest, len.value);
+    }
+    return Err(invalid_type("an extension", mp_type_name(b)));
+}
+
+// `size` data bytes after a type byte.
+Result(Parsed(MpExt, MsgpackDec), SerialError) md_ext_bytes(MsgpackDec d, Int size) {
+    if (d.pos + 1 + size > d.in.len()) { return Err(eof_error("an extension")); }
+    Int kind = d.in[d.pos];
+    List(Int) data = d.in[d.pos + 1..d.pos + 1 + size];
+    return parsed(MpExt {.kind = kind, .data = data}, md_take(d, 1 + size));
+}
+
+// How many data bytes the fixed forms carry, and where they start.
+pub Int mp_ext_len(Int b) {
+    if (b == mp_fixext1()) { return 1; }
+    if (b == mp_fixext2()) { return 2; }
+    if (b == mp_fixext4()) { return 4; }
+    if (b == mp_fixext8()) { return 8; }
+    if (b == mp_fixext16()) { return 16; }
+    return 0 - 1;
+}
+
+Str mp_type_name(Int b) {
+    if (b < 0x80) { return "an unsigned integer"; }
+    if (b >= 0xE0) { return "a negative integer"; }
+    if (b == mp_nil()) { return "null"; }
+    if (b == mp_false() || b == mp_true()) { return "a boolean"; }
+    if (b == mp_float32() || b == mp_float64()) { return "a float"; }
+    if (b == mp_str8() || b == mp_str16() || b == mp_str32()) { return "a string"; }
+    if (b == mp_bin8() || b == mp_bin16() || b == mp_bin32()) { return "bytes"; }
+    if (b == mp_array16() || b == mp_array32()) { return "a sequence"; }
+    if (b == mp_map16() || b == mp_map32()) { return "a map"; }
+    if (b == mp_uint8() || b == mp_uint16() || b == mp_uint32() || b == mp_uint64()) { return "an unsigned integer"; }
+    if (b == mp_int8() || b == mp_int16() || b == mp_int32() || b == mp_int64()) { return "a negative integer"; }
+    if (b >= 0xD4 && b <= 0xD8) { return "an extension"; }
+    if (b == mp_ext8() || b == mp_ext16() || b == mp_ext32()) { return "an extension"; }
+    return "a reserved byte";
+}
+
+// ─── Scalars ─────────────────────────────────────────────────────────
+
+Result(MsgpackDec, SerialError) md_unit(MsgpackDec d) {
+    Parsed(Int, MsgpackDec) t = md_type(d, "nil")?;
+        if (t.value == mp_nil()) { return Ok(t.rest); }
+        return Err(invalid_type("nil", mp_type_name(t.value)));
+}
+
+Result(Parsed(Bool, MsgpackDec), SerialError) md_bool(MsgpackDec d) {
+    Parsed(Int, MsgpackDec) t = md_type(d, "a boolean")?;
+        if (t.value == mp_true()) { return parsed(true, t.rest); }
+        if (t.value == mp_false()) { return parsed(false, t.rest); }
+        return Err(invalid_type("a boolean", mp_type_name(t.value)));
+}
+
+Result(Parsed(Int, MsgpackDec), SerialError) md_int(MsgpackDec d) {
+    Parsed(Int, MsgpackDec) t = md_type(d, "an integer")?;
+        if (t.value < 128) { return parsed(t.value, t.rest); }
+        if (t.value >= 0xE0) { return parsed(t.value - 256, t.rest); }
+        if (t.value == mp_uint8()) { return md_small(t.rest, 1, "an integer"); }
+        if (t.value == mp_uint16()) { return md_small(t.rest, 2, "an integer"); }
+        if (t.value == mp_uint32()) { return md_small(t.rest, 4, "an integer"); }
+        if (t.value == mp_int8() || t.value == mp_int16() || t.value == mp_int32()) { return md_signed(t.rest, mp_fixed_width(t.value), "an integer"); }
+        if (t.value == mp_uint64() || t.value == mp_int64()) { return md_int64(t.rest); }
+        return Err(invalid_type("an integer", mp_type_name(t.value)));
+}
+
+// A signed payload: the bytes read as an unsigned number and carried into
+// the sign range.
+Result(Parsed(Int, MsgpackDec), SerialError) md_signed(MsgpackDec d, Int n, Str what) {
+    Parsed(Int, MsgpackDec) v = md_small(d, n, what)?;
+    Int raw = v.value;
+    Int signed = if (n == 1 && raw >= 128) { raw - 256 } else { if (n == 2 && raw >= 32768) { raw - 65536 } else { if (n == 4 && raw >= 2147483648) { raw - 4294967296 } else { raw } } };
+    return parsed(signed, v.rest);
+}
+
+// A 64-bit payload read as Int: the wide unsigned forms above Int's range
+// are an error, not a wrap.
+Result(Parsed(Int, MsgpackDec), SerialError) md_int64(MsgpackDec d) {
+    Parsed(UInt(64), MsgpackDec) w = md_wide(d, 8, "an integer")?;
+    if (w.value > u64(9223372036854775807)) { return Err(invalid_value(f"{w.value}", "an Int")); }
+    return parsed((Int)w.value, w.rest);
+}
+
+Result(Parsed(UInt(64), MsgpackDec), SerialError) md_uint(MsgpackDec d) {
+    Parsed(Int, MsgpackDec) t = md_type(d, "an unsigned integer")?;
+        if (t.value < 128) { return parsed((UInt(64))t.value, t.rest); }
+        if (t.value == mp_uint8()) { return md_uint_small(t.rest, 1); }
+        if (t.value == mp_uint16()) { return md_uint_small(t.rest, 2); }
+        if (t.value == mp_uint32()) { return md_uint_small(t.rest, 4); }
+        if (t.value == mp_uint64()) { return md_wide(t.rest, 8, "an unsigned integer"); }
+        return Err(invalid_type("an unsigned integer", mp_type_name(t.value)));
+}
+
+Result(Parsed(UInt(64), MsgpackDec), SerialError) md_uint_small(MsgpackDec d, Int n) {
+    Parsed(Int, MsgpackDec) v = md_small(d, n, "an integer")?;
+    return parsed((UInt(64))v.value, v.rest);
+}
+
+Result(Parsed(Int(128), MsgpackDec), SerialError) md_i128(MsgpackDec d) {
+    Parsed(Int, MsgpackDec) t = md_type(d, "a 128-bit integer")?;
+        if (t.value < 128) { return parsed((Int(128))t.value, t.rest); }
+        if (t.value >= 0xE0) { return parsed((Int(128))(t.value - 256), t.rest); }
+        if (t.value == mp_uint8()) { return md_i128_small(t.rest, 1); }
+        if (t.value == mp_uint16()) { return md_i128_small(t.rest, 2); }
+        if (t.value == mp_uint32()) { return md_i128_small(t.rest, 4); }
+        if (t.value == mp_int8() || t.value == mp_int16() || t.value == mp_int32()) { return md_i128_signed(t.rest, mp_fixed_width(t.value)); }
+        if (t.value == mp_uint64() || t.value == mp_int64()) { return md_i128_wide(t.rest); }
+        if (mp_ext_len(t.value) >= 0 || t.value == mp_ext8() || t.value == mp_ext16() || t.value == mp_ext32()) { return md_i128_ext(t.rest, t.value); }
+        return Err(invalid_type("a 128-bit integer", mp_type_name(t.value)));
+}
+
+Result(Parsed(Int(128), MsgpackDec), SerialError) md_i128_signed(MsgpackDec d, Int n) {
+    Parsed(Int, MsgpackDec) v = md_signed(d, n, "a 128-bit integer")?;
+    return parsed((Int(128))v.value, v.rest);
+}
+
+Result(Parsed(Int(128), MsgpackDec), SerialError) md_i128_small(MsgpackDec d, Int n) {
+    Parsed(Int, MsgpackDec) v = md_small(d, n, "a 128-bit integer")?;
+    return parsed((Int(128))v.value, v.rest);
+}
+
+Result(Parsed(Int(128), MsgpackDec), SerialError) md_i128_wide(MsgpackDec d) {
+    Parsed(UInt(64), MsgpackDec) w = md_wide(d, 8, "a 128-bit integer")?;
+    if (w.value <= u64(9223372036854775807)) { return parsed((Int(128))w.value, w.rest); }
+    return parsed(i128(0) - (Int(128))w.value, w.rest);
+}
+
+// Unsigned: the plain unsigned forms, or a bignum ext (type 2). A negative
+// form is an error rather than a wrap.
+Result(Parsed(UInt(128), MsgpackDec), SerialError) md_u128(MsgpackDec d) {
+    Parsed(Int, MsgpackDec) t = md_type(d, "an unsigned 128-bit integer")?;
+    if (t.value < 128) { return parsed((UInt(128))t.value, t.rest); }
+    if (t.value == mp_uint8()) { return md_u128_small(t.rest, 1); }
+    if (t.value == mp_uint16()) { return md_u128_small(t.rest, 2); }
+    if (t.value == mp_uint32()) { return md_u128_small(t.rest, 4); }
+    if (t.value == mp_uint64()) { return md_u128_wide(t.rest); }
+    if (mp_ext_len(t.value) >= 0 || t.value == mp_ext8() || t.value == mp_ext16() || t.value == mp_ext32()) { return md_u128_ext(t.rest, t.value); }
+    return Err(invalid_type("an unsigned 128-bit integer", mp_type_name(t.value)));
+}
+
+Result(Parsed(UInt(128), MsgpackDec), SerialError) md_u128_small(MsgpackDec d, Int n) {
+    Parsed(Int, MsgpackDec) v = md_small(d, n, "an unsigned 128-bit integer")?;
+    return parsed((UInt(128))v.value, v.rest);
+}
+
+Result(Parsed(UInt(128), MsgpackDec), SerialError) md_u128_wide(MsgpackDec d) {
+    Parsed(UInt(64), MsgpackDec) v = md_wide(d, 8, "an unsigned 128-bit integer")?;
+    return parsed((UInt(128))v.value, v.rest);
+}
+
+Result(Parsed(UInt(128), MsgpackDec), SerialError) md_u128_ext(MsgpackDec d, Int b) {
+    Parsed(MpExt, MsgpackDec) e2 = md_ext_with(d, b)?;
+    if (e2.value.kind == 3) { return Err(invalid_value("a negative bignum", "an unsigned 128-bit integer")); }
+    return parsed(mp_be_value(e2.value.data), e2.rest);
+}
+
+// A bignum ext: its data as a magnitude.
+Result(Parsed(Int(128), MsgpackDec), SerialError) md_i128_ext(MsgpackDec d, Int b) {
+    Parsed(MpExt, MsgpackDec) e2 = md_ext_with(d, b)?;
+    UInt(128) mag = mp_be_value(e2.value.data);
+    if (e2.value.kind == 3) { return parsed(i128(0) - (Int(128))mag - i128(1), e2.rest); }
+    return parsed((Int(128))mag, e2.rest);
+}
+
+UInt(128) mp_be_value(List(Int) bs) { return mp_be_value_at(bs, 0, u128(0)); }
+
+UInt(128) mp_be_value_at(List(Int) bs, Int i, UInt(128) acc) {
+    if (i >= bs.len()) { return acc; }
+    return mp_be_value_at(bs, i + 1, (acc << 8) | (UInt(128))bs[i]);
+}
+
+Result(Parsed(Float, MsgpackDec), SerialError) md_float(MsgpackDec d) {
+    Parsed(Int, MsgpackDec) t = md_type(d, "a float")?;
+        if (t.value == mp_float32()) {
+            if (t.rest.pos + 4 > t.rest.in.len()) { return Err(eof_error("a single-precision float")); }
+            return parsed(mp_f32_from(t.rest.in, t.rest.pos), md_take(t.rest, 4));
+        }
+        if (t.value == mp_float64()) {
+            if (t.rest.pos + 8 > t.rest.in.len()) { return Err(eof_error("a double-precision float")); }
+            return parsed(mp_f64_from(t.rest.in, t.rest.pos), md_take(t.rest, 8));
+        }
+        return Err(invalid_type("a float", mp_type_name(t.value)));
+}
+
+// ─── Strings and bytes ───────────────────────────────────────────────
+
+Result(Parsed(Str, MsgpackDec), SerialError) md_str(MsgpackDec d) {
+    Parsed(Int, MsgpackDec) n = md_str_begin(d)?;
+    // The frame holds the byte length; the count read_str_begin reports is
+    // in code points, which is not what a whole string needs.
+    MpLeft left = md_left(n.rest, 3);
+    if (!left.ok) { return Err(custom_error(left.why)); }
+    Int len = left.n;
+    MsgpackDec d1 = md_pop(n.rest);
+    if (d1.pos + len > d1.in.len()) { return Err(eof_error("a string")); }
+    Result(Str, SerialError) r = mp_str_at(d1.in, d1.pos, d1.pos + len, "a string");
+    if (Err(e) = r) { return Err(e); }
+    return match r { Ok(s) => parsed(s, md_take(d1, len)), Err(e) => Err(e) };
+}
+
+// The length in bytes, from the type byte, with the frame pushed.
+Result(Parsed(Int, MsgpackDec), SerialError) md_str_begin(MsgpackDec d) {
+    Parsed(Int, MsgpackDec) head = md_str_head(d)?;
+    Parsed(Int, MsgpackDec) n = md_small(head.rest, head.value, "a string")?;
+    Int len = n.value;
+    Int chars = mp_cp_count(n.rest.in, n.rest.pos, n.rest.pos + len, "a string")?;
+    return parsed(chars, md_push(n.rest, MpStr(len)));
+}
+
+Result(Parsed(Int, MsgpackDec), SerialError) md_str_head(MsgpackDec d) {
+    Parsed(Int, MsgpackDec) t = md_type(d, "a string")?;
+        if (t.value == mp_str8()) { return parsed(1, t.rest); }
+        if (t.value == mp_str16()) { return parsed(2, t.rest); }
+        if (t.value == mp_str32()) { return parsed(4, t.rest); }
+        return Err(invalid_type("a string", mp_type_name(t.value)));
+}
+
+Result(Parsed(Int, MsgpackDec), SerialError) md_str_next(MsgpackDec d) {
+    MpLeft left = md_left(d, 3);
+    if (!left.ok) { return Err(custom_error(left.why)); }
+    if (left.n == 0) { return parsed(0 - 1, md_pop(d)); }
+    Result(MpCp, SerialError) r = mp_cp_at(d.in, d.pos, "a string");
+    if (Err(e) = r) { return Err(e); }
+    if (Ok(c) = r) { return parsed(c.cp, md_set_left(md_take(d, c.next - d.pos), left.n - (c.next - d.pos))); }
+    return Err(eof_error("a string"));
+}
+
+Result(Parsed(List(Int), MsgpackDec), SerialError) md_bytes(MsgpackDec d) {
+    Parsed(Int, MsgpackDec) n = md_bytes_begin(d)?;
+    Int len = n.value;
+    MsgpackDec d1 = md_pop(n.rest);
+    if (d1.pos + len > d1.in.len()) { return Err(eof_error("bytes")); }
+    return parsed(d1.in[d1.pos..d1.pos + len], md_take(d1, len));
+}
+
+Result(Parsed(Int, MsgpackDec), SerialError) md_bytes_begin(MsgpackDec d) {
+    Parsed(Int, MsgpackDec) head = md_bin_head(d)?;
+    Parsed(Int, MsgpackDec) n = md_small(head.rest, head.value, "bytes")?;
+    Int len = n.value;
+    return parsed(len, md_push(n.rest, MpBin(len)));
+}
+
+Result(Parsed(Int, MsgpackDec), SerialError) md_bin_head(MsgpackDec d) {
+    Parsed(Int, MsgpackDec) t = md_type(d, "bytes")?;
+        if (t.value == mp_bin8()) { return parsed(1, t.rest); }
+        if (t.value == mp_bin16()) { return parsed(2, t.rest); }
+        if (t.value == mp_bin32()) { return parsed(4, t.rest); }
+        return Err(invalid_type("bytes", mp_type_name(t.value)));
+}
+
+Result(Parsed(Int, MsgpackDec), SerialError) md_bytes_next(MsgpackDec d) {
+    MpLeft left = md_left(d, 2);
+    if (!left.ok) { return Err(custom_error(left.why)); }
+    if (left.n == 0) { return parsed(0 - 1, md_pop(d)); }
+    if (d.pos >= d.in.len()) { return Err(eof_error("bytes")); }
+    return parsed(d.in[d.pos], md_set_left(md_take(d, 1), left.n - 1));
+}
+
+// ─── Options ─────────────────────────────────────────────────────────
+
+Result(Parsed(Bool, MsgpackDec), SerialError) md_option(MsgpackDec d) {
+    Parsed(Int, MsgpackDec) t = md_type(d, "an option")?;
+        if (t.value == mp_nil()) { return parsed(false, t.rest); }
+        return parsed(true, d);
+}
+
+// ─── Sequences and maps ──────────────────────────────────────────────
+
+Result(Parsed(Int, MsgpackDec), SerialError) md_seq_begin(MsgpackDec d) { return md_container_begin(d, mp_array16(), mp_array32(), "a sequence"); }
+
+Result(Parsed(Bool, MsgpackDec), SerialError) md_seq_next(MsgpackDec d) {
+    MpLeft left = md_left(d, 4);
+    if (!left.ok) { return Err(custom_error(left.why)); }
+    if (left.n == 0) { return parsed(false, md_pop(d)); }
+    return parsed(true, md_set_left(d, left.n - 1));
+}
+
+Result(Parsed(Int, MsgpackDec), SerialError) md_map_begin(MsgpackDec d) { return md_container_begin(d, mp_map16(), mp_map32(), "a map"); }
+
+Result(Parsed(Bool, MsgpackDec), SerialError) md_map_next(MsgpackDec d) {
+    MpLeft left = md_left(d, 5);
+    if (!left.ok) { return Err(custom_error(left.why)); }
+    if (left.n == 0) { return parsed(false, md_pop(d)); }
+    return parsed(true, md_set_left(d, left.n - 1));
+}
+
+Result(MsgpackDec, SerialError) md_map_value(MsgpackDec d) { return Ok(d); }
+
+Result(Parsed(Int, MsgpackDec), SerialError) md_container_begin(MsgpackDec d, Int two, Int four, Str what) {
+    Parsed(Int, MsgpackDec) t = md_type(d, what)?;
+        if (t.value == two) {
+            Parsed(Int, MsgpackDec) n = md_small(t.rest, 2, what)?;
+            return parsed(n.value, md_push(n.rest, if (two == mp_array16()) { MpArr(n.value) } else { MpMap(n.value) }));
+        }
+        if (t.value == four) {
+            Parsed(Int, MsgpackDec) n = md_small(t.rest, 4, what)?;
+            return parsed(n.value, md_push(n.rest, if (two == mp_array16()) { MpArr(n.value) } else { MpMap(n.value) }));
+        }
+        return Err(invalid_type(what, mp_type_name(t.value)));
+}
+
+// ─── Structs ─────────────────────────────────────────────────────────
+
+Result(MsgpackDec, SerialError) md_struct_begin(MsgpackDec d, Str name, List(Str) fields) {
+    Parsed(Int, MsgpackDec) n = md_map_begin(d)?;
+    return Ok(n.rest);
+}
+
+Result(Parsed(FieldKey, MsgpackDec), SerialError) md_field(MsgpackDec d, List(Str) fields) {
+    MpLeft left = md_left(d, 5);
+    if (!left.ok) { return Err(custom_error(left.why)); }
+    if (left.n == 0) { return parsed(EndOfFields, md_pop(d)); }
+    return md_field_key(md_set_left(d, left.n - 1), fields);
+}
+
+Result(Parsed(FieldKey, MsgpackDec), SerialError) md_field_key(MsgpackDec d, List(Str) fields) {
+    Parsed(Str, MsgpackDec) key = md_str(d)?;
+    Int idx = name_index(fields, key.value);
+    return parsed(if (idx < 0) { UnknownField(key.value) } else { KnownField(idx) }, key.rest);
+}
+
+// ─── Variants ────────────────────────────────────────────────────────
+
+Result(Parsed(Str, MsgpackDec), SerialError) md_variant_name_at(MsgpackDec d) {
+    Parsed(Int, MsgpackDec) t = md_type(d, "an enum variant")?;
+        MsgpackDec d1 = t.rest;
+        // An ext is transparent here: the variant it wraps names itself.
+        if (mp_ext_len(t.value) >= 0 || t.value == mp_ext8() || t.value == mp_ext16() || t.value == mp_ext32()) {
+            Parsed(MpExt, MsgpackDec) e2 = md_ext_with(d1, t.value)?;
+            return md_variant_name_at(e2.rest);
+        }
+        if (t.value == mp_str8() || t.value == mp_str16() || t.value == mp_str32()) { return md_str(d); }
+        if (t.value == mp_map16() || t.value == mp_map32()) {
+            Parsed(Int, MsgpackDec) n = md_container_begin(d, mp_map16(), mp_map32(), "a variant")?;
+            Int len = n.value;
+            if (len == 0) { return Err(syntax_error("a variant map has no name")); }
+            Parsed(FieldKey, MsgpackDec) k = md_field_key(md_set_left(n.rest, len - 1), [])?;
+            MsgpackDec d2 = md_payloads(md_vmaps(k.rest, k.rest.vmaps + 1), k.rest.payloads + 1);
+            return parsed(mp_field_name(k.value), d2);
+        }
+        return Err(invalid_type("an enum variant", mp_type_name(t.value)));
+}
+
+Str mp_field_name(FieldKey k) { return match k { UnknownField(n) => n, KnownField(i) => "", EndOfFields => "" }; }
+
+Result(Parsed(Int, MsgpackDec), SerialError) md_variant(MsgpackDec d, Str enum_name, List(Str) variants) {
+    Parsed(Str, MsgpackDec) n = md_variant_name_at(d)?;
+    Int idx = name_index(variants, n.value);
+    if (idx < 0) { return Err(unknown_variant(n.value, variants)); }
+    return parsed(idx, n.rest);
+}
+
+Result(Parsed(VariantName, MsgpackDec), SerialError) md_variant_name(MsgpackDec d) {
+    Parsed(Str, MsgpackDec) n = md_variant_name_at(d)?;
+    return parsed(VariantName {.enum_name = "", .index = 0 - 1, .name = n.value, .has_payload = n.rest.payloads > 0}, n.rest);
+}
+
+Result(MsgpackDec, SerialError) md_variant_payload(MsgpackDec d) {
+    if (d.payloads < 1) { return Err(custom_error("read_variant_payload without a payload")); }
+    return Ok(md_payloads(d, d.payloads - 1));
+}
+
+Result(MsgpackDec, SerialError) md_variant_unit(MsgpackDec d) {
+    if (d.payloads > 0) { return Err(custom_error("read_variant_unit on a variant with a payload")); }
+    return Ok(d);
+}
+
+Result(MsgpackDec, SerialError) md_variant_end(MsgpackDec d) {
+    if (d.payloads > 0) { return Err(custom_error("read_variant_end before the payload")); }
+    if (d.vmaps < 1) { return Ok(d); }
+    MpLeft left = md_left(d, 5);
+    if (!left.ok) { return Err(custom_error(left.why)); }
+    if (left.n != 0) { return Err(syntax_error("a variant map has more than one entry")); }
+    return Ok(md_vmaps(md_pop(d), d.vmaps - 1));
+}
+
+MsgpackDec md_payloads(MsgpackDec d, Int n) { return MsgpackDec {.in = d.in, .pos = d.pos, .open = d.open, .payloads = n, .vmaps = d.vmaps}; }
+
+MsgpackDec md_vmaps(MsgpackDec d, Int n) { return MsgpackDec {.in = d.in, .pos = d.pos, .open = d.open, .payloads = d.payloads, .vmaps = n}; }
+
+// ─── Untyped reads ───────────────────────────────────────────────────
+
+Result(Parsed(Peek, MsgpackDec), SerialError) md_peek(MsgpackDec d) {
+    Parsed(Int, MsgpackDec) t = md_type(d, "a value")?;
+    Int b = t.value;
+    if (mp_ext_len(b) >= 0 || b == mp_ext8() || b == mp_ext16() || b == mp_ext32()) { return md_peek_ext(d, t.rest, b); }
+    return parsed(mp_peek_kind(b), d);
+}
+
+// An ext is a bignum when its type says so, anything else a variant. The
+// ext is read to find its type and then put back: a peek consumes nothing.
+Result(Parsed(Peek, MsgpackDec), SerialError) md_peek_ext(MsgpackDec start, MsgpackDec d, Int b) {
+    Parsed(MpExt, MsgpackDec) e2 = md_ext_with(d, b)?;
+    Int kind = e2.value.kind;
+    return parsed(if (kind == 2) { PeekU128 } else { if (kind == 3) { PeekI128 } else { PeekVariant } }, start);
+}
+
+Peek mp_peek_kind(Int b) {
+    if (b < 128) { return PeekUInt; }
+    if (b >= 0xE0) { return PeekInt; }
+    if (b == mp_nil()) { return PeekNone; }
+    if (b == mp_false() || b == mp_true()) { return PeekBool; }
+    if (b == mp_float32() || b == mp_float64()) { return PeekFloat; }
+    if (b == mp_str8() || b == mp_str16() || b == mp_str32()) { return PeekStr; }
+    if (b == mp_bin8() || b == mp_bin16() || b == mp_bin32()) { return PeekBytes; }
+    if (b == mp_array16() || b == mp_array32()) { return PeekSeq; }
+    if (b == mp_map16() || b == mp_map32()) { return PeekMap; }
+    if (b == mp_uint8() || b == mp_uint16() || b == mp_uint32() || b == mp_uint64()) { return PeekUInt; }
+    if (b == mp_int8() || b == mp_int16() || b == mp_int32() || b == mp_int64()) { return PeekInt; }
+    return PeekVariant;
+}
+
+Result(MsgpackDec, SerialError) md_skip(MsgpackDec d) { return md_skip_at(d, "a value"); }
+
+Result(MsgpackDec, SerialError) md_skip_at(MsgpackDec d, Str what) {
+    Parsed(Int, MsgpackDec) t = md_type(d, what)?;
+        Int k = t.value;
+        if (k == mp_str8() || k == mp_str16() || k == mp_str32()) { Parsed(Str, MsgpackDec) s = md_str(t.rest)?; return Ok(s.rest); }
+        if (k == mp_bin8() || k == mp_bin16() || k == mp_bin32()) { Parsed(List(Int), MsgpackDec) s = md_bytes(t.rest)?; return Ok(s.rest); }
+        if (k == mp_float64()) { return Ok(md_take(t.rest, 8)); }
+        if (k == mp_float32()) { return Ok(md_take(t.rest, 4)); }
+        if (k == mp_array16() || k == mp_array32()) {
+            Parsed(Int, MsgpackDec) n = md_container_begin(t.rest, mp_array16(), mp_array32(), "an array")?;
+            return md_skip_items(n.value, n.rest, "an array item", false);
+        }
+        if (k == mp_map16() || k == mp_map32()) {
+            Parsed(Int, MsgpackDec) n = md_container_begin(t.rest, mp_map16(), mp_map32(), "a map")?;
+            return md_skip_items(n.value, n.rest, "a map entry", true);
+        }
+        if (k >= 0xCC && k <= 0xCF) { return Ok(md_take(t.rest, mp_fixed_width(k))); }
+        if (k >= 0xD0 && k <= 0xD3) { return Ok(md_take(t.rest, mp_fixed_width(k))); }
+        if (mp_ext_len(k) >= 0) { return Ok(md_take(t.rest, 1 + mp_ext_len(k))); }
+        if (k == mp_ext8() || k == mp_ext16() || k == mp_ext32()) { return md_skip_ext(t.rest, k); }
+        return Ok(t.rest);
+}
+
+Int mp_fixed_width(Int b) {
+    if (b == mp_uint8() || b == mp_int8()) { return 1; }
+    if (b == mp_uint16() || b == mp_int16()) { return 2; }
+    if (b == mp_uint32() || b == mp_int32()) { return 4; }
+    return 8;
+}
+
+Result(MsgpackDec, SerialError) md_skip_ext(MsgpackDec d, Int b) {
+    Int w = if (b == mp_ext8()) { 1 } else { if (b == mp_ext16()) { 2 } else { 4 } };
+    Parsed(Int, MsgpackDec) n = md_small(d, w, "an extension")?;
+    return Ok(md_take(n.rest, 1 + n.value));
+}
+
+Result(MsgpackDec, SerialError) md_skip_items(Int left, MsgpackDec d, Str what, Bool pairs) {
+    if (left <= 0) { return Ok(d); }
+    MsgpackDec d1 = md_skip_at(d, what)?;
+    MsgpackDec d2 = if (pairs) { md_skip_at(d1, what)? } else { d1 };
+    return md_skip_items(left - 1, d2, what, pairs);
+}
+
+Result(MsgpackDec, SerialError) md_end(MsgpackDec d) {
+    if (d.pos < d.in.len()) { return Err(trailing_input(f"{d.in.len() - d.pos} byte(s)")); }
+    return Ok(d);
+}
+
+Bool md_human(MsgpackDec d) { return false; }
+
+Decoder(MsgpackDec) = {
+    .read_unit = md_unit, .read_bool = md_bool, .read_int = md_int, .read_uint = md_uint,
+    .read_i128 = md_i128, .read_u128 = md_u128,
+    .read_float = md_float, .read_str = md_str, .read_bytes = md_bytes, .read_option = md_option,
+    .read_str_begin = md_str_begin, .read_str_next = md_str_next, .read_bytes_begin = md_bytes_begin, .read_bytes_next = md_bytes_next,
+    .read_seq_begin = md_seq_begin, .read_seq_next = md_seq_next, .read_map_begin = md_map_begin,
+    .read_map_next = md_map_next, .read_map_value = md_map_value, .read_struct_begin = md_struct_begin,
+    .read_field = md_field, .read_variant = md_variant, .read_variant_name = md_variant_name,
+    .read_variant_unit = md_variant_unit, .read_variant_payload = md_variant_payload,
+    .read_variant_end = md_variant_end, .read_skip = md_skip, .read_peek = md_peek, .read_end = md_end,
+    .decodes_human_readable = md_human
+};
+
+// ─── Entry points ────────────────────────────────────────────────────
+
+@needs(Decode(T, MsgpackDec))
+pub Result(T, SerialError) from_msgpack(List(Int) bs) { return decode_value(msgpack_decoder(bs)); }
+
+@needs(Decode(T, MsgpackDec))
+pub Result(T, SerialError) from_msgpack_hex(Str hex) {
+    Result(List(Int), SerialError) r = mp_unhex(hex);
+    if (Err(e) = r) { return Err(e); }
+    return match r { Ok(bs) => from_msgpack(bs), Err(e) => Err(e) };
+}
+
+pub Str msgpack_to_hex(List(Int) bs) { return mp_hex(bs); }

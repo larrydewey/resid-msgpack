@@ -1,0 +1,32 @@
+ok   e/empty
+ok   e/array eof
+ok   e/string eof
+ok   e/struct eof
+ok   e/trailing
+ok   t/reserved
+ok   t/stray nil
+ok   t/bool as int
+ok   t/str as int
+ok   t/bin as str
+ok   t/array as str
+ok   t/map as array
+ok   t/float as int
+ok   e/uint8 short
+ok   e/uint32 short
+ok   e/float32 short
+ok   e/bin short
+ok   e/str length lies
+ok   f/missing
+ok   f/duplicate
+ok   v/unknown
+ok   v/not a variant
+ok   v/empty map
+ok   v/two entries
+ok   n/u64 as Int
+ok   n/bignum too long
+ok   u/truncated sequence
+ok   u/continuation first
+ok   u/bad continuation
+ok   hex/odd length
+ok   hex/bad digit
+exit 0

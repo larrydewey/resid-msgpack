@@ -1,0 +1,144 @@
+// errors.resid — what the format reports when the bytes are wrong. Every
+// case is an error value with a kind and a path, never an abort.
+
+import "../src/msgpack.resid";
+import "check.resid";
+
+type Point = { Int x; Int y; };
+
+type Shape = Circle(Int) | Dot;
+
+List(Str) point_fields() { return ["x", "y"]; }
+
+List(Str) shape_variants() { return ["Circle", "Dot"]; }
+
+@needs(Decoder(F))
+Result(Parsed(Point, F), SerialError) dec_point(F s) {
+    F s1 = read_struct_begin(s, "Point", point_fields())?;
+    return dec_point_fields(s1, None, None);
+}
+Decode(Point, F) = dec_point;
+
+@needs(Decoder(F))
+Result(Parsed(Point, F), SerialError) dec_point_fields(F s, Option(Int) x, Option(Int) y) {
+    Parsed(FieldKey, F) k = read_field(s, point_fields())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => dec_point_slot(k.rest, i, x, y),
+        UnknownField(name) => dec_point_fields(skip_unknown(k.rest, name, point_fields(), false)?, x, y),
+        EndOfFields => finish_point(k.rest, x, y)
+    };
+}
+
+@needs(Decoder(F))
+Result(Parsed(Point, F), SerialError) dec_point_slot(F s, Int i, Option(Int) x, Option(Int) y) {
+    if (i == 0) {
+        Parsed(Option(Int), F) v = read_slot(s, x, "x")?;
+        return dec_point_fields(v.rest, v.value, y);
+    }
+    Parsed(Option(Int), F) v = read_slot(s, y, "y")?;
+    return dec_point_fields(v.rest, x, v.value);
+}
+
+Result(Parsed(Point, F), SerialError) finish_point(F s, Option(Int) x, Option(Int) y) {
+    Int xv = require(x, "x")?;
+    Int yv = require(y, "y")?;
+    return parsed(Point {.x = xv, .y = yv}, s);
+}
+
+@needs(Decoder(F))
+Result(Parsed(Shape, F), SerialError) dec_shape(F s) {
+    Parsed(Int, F) v = read_variant(s, "Shape", shape_variants())?;
+    if (v.value == 0) {
+        Parsed(Int, F) r = read_newtype_payload(v.rest, "Circle")?;
+        return parsed(Circle(r.value), r.rest);
+    }
+    return read_unit_payload(v.rest, Dot);
+}
+Decode(Shape, F) = dec_shape;
+
+// ─── Helpers ─────────────────────────────────────────────────────────
+
+Str int_err(Str text) {
+    Result(Int, SerialError) r = from_msgpack_hex(text);
+    return err_of(r);
+}
+
+Str str_err(Str text) {
+    Result(Str, SerialError) r = from_msgpack_hex(text);
+    return err_of(r);
+}
+
+Str list_err(Str text) {
+    Result(List(Int), SerialError) r = from_msgpack_hex(text);
+    return err_of(r);
+}
+
+Str point_err(Str text) {
+    Result(Point, SerialError) r = from_msgpack_hex(text);
+    return err_of(r);
+}
+
+Str shape_err(Str text) {
+    Result(Shape, SerialError) r = from_msgpack_hex(text);
+    return err_of(r);
+}
+
+Str bytes_err(Str text) {
+    Result(ByteBuf, SerialError) r = from_msgpack_hex(text);
+    return err_of(r);
+}
+
+Str big_err(Str text) {
+    Result(Int(128), SerialError) r = from_msgpack_hex(text);
+    return err_of(r);
+}
+
+Int main() {
+    // Nothing at all, and nothing after.
+    check_text("e/empty", int_err(""), "unexpected end of input, expected an integer");
+    check_text("e/array eof", list_err("dc00030102"), "unexpected end of input, expected an integer at [2]");
+    check_text("e/string eof", str_err("d9044945"), "unexpected end of input, expected a string");
+    check_text("e/struct eof", point_err("de0001d9017801"), "missing field `y`");
+    check_text("e/trailing", int_err("0101"), "trailing input after the value: 1 byte(s)");
+
+    // Reserved and misapplied type bytes.
+    check_text("t/reserved", int_err("c1"), "invalid type: expected an integer, found a reserved byte");
+    check_text("t/stray nil", int_err("c0"), "invalid type: expected an integer, found null");
+    check_text("t/bool as int", int_err("c3"), "invalid type: expected an integer, found a boolean");
+    check_text("t/str as int", int_err("d90161"), "invalid type: expected an integer, found a string");
+    check_text("t/bin as str", str_err("c40102"), "invalid type: expected a string, found bytes");
+    check_text("t/array as str", str_err("dc0000"), "invalid type: expected a string, found a sequence");
+    check_text("t/map as array", list_err("de0000"), "invalid type: expected a sequence, found a map");
+    check_text("t/float as int", int_err("ca3fc00000"), "invalid type: expected an integer, found a float");
+
+    // Truncated payloads.
+    check_text("e/uint8 short", int_err("cc"), "unexpected end of input, expected an integer");
+    check_text("e/uint32 short", int_err("ce0001"), "unexpected end of input, expected an integer");
+    check_text("e/float32 short", str_err("ca3fc0"), "invalid type: expected a string, found a float");
+    check_text("e/bin short", bytes_err("c40301"), "unexpected end of input, expected bytes");
+    check_text("e/str length lies", str_err("d9044142"), "unexpected end of input, expected a string");
+
+    // Struct fields and variants.
+    check_text("f/missing", point_err("de0001d9017801"), "missing field `y`");
+    check_text("f/duplicate", point_err("de0003d9017801d9017902d9017803"), "duplicate field `x`");
+    check_text("v/unknown", shape_err("d9035a7a7a"), "unknown variant `Zzz`, expected `Circle` or `Dot`");
+    check_text("v/not a variant", shape_err("05"), "invalid type: expected an enum variant, found an unsigned integer");
+    check_text("v/empty map", shape_err("de0000"), "a variant map has no name");
+    check_text("v/two entries", shape_err("de0002d906436972636c6503d903446f7403"), "a variant map has more than one entry");
+
+    // Numbers out of range for the type asked for.
+    check_text("n/u64 as Int", int_err("cfffffffffffffffff"), "invalid value 18446744073709551615, expected an Int");
+    check_text("n/bignum too long", big_err("c902" + str_repeat("00", 17)), "unexpected end of input, expected an extension");
+
+    // Text that is not text.
+    check_text("u/truncated sequence", str_err("d901c3"), "unexpected end of input, expected a string");
+    check_text("u/continuation first", str_err("d90280bf"), "invalid UTF-8 in a string: a continuation byte starts it");
+    check_text("u/bad continuation", str_err("d902c341"), "invalid UTF-8 in a string");
+
+    // The hex front end.
+    check_text("hex/odd length", err_of(mp_unhex("010")), "invalid hex digit in \"010\"");
+    check_text("hex/bad digit", err_of(mp_unhex("01zz")), "invalid hex digit in \"01zz\"");
+
+    return 0;
+}
