@@ -7,8 +7,8 @@
 // single bytes (positive 0..127, negative -32..-1), and the floats are
 // 32-bit or 64-bit.
 
-import "../../resid-serial/src/serial.resid";
-import "../../resid-serial/src/seq.resid";
+import "resid-serial/serial.resid";
+import "resid-serial/seq.resid";
 
 // ─── Type headers ────────────────────────────────────────────────────
 

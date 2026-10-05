@@ -80,6 +80,11 @@ regenerates `tests/model_serial.resid` before compiling.
 ## Requirements
 
 A Resid compiler with the changes made alongside resid-serial (spec v3.8).
-The framework lives in the sibling `../resid-serial` checkout; `resid.toml`
-declares it as a dependency for the manifest tool, and `src/*.resid` import
-it by path so an ordinary `residc` build works with no manifest at all.
+The framework is a dependency in `resid.toml`, and `src/*.resid` import it
+by package name (`import "resid-serial/serial.resid";`), so it resolves the
+same from a sibling `../resid-serial` checkout or from a registry, and
+compiles inside its declared capability ceiling. Build through the
+manifest tool (`resid-manifest build resid.toml residc`), or pass
+`residc` the dependency map it writes (`resid-manifest depmap resid.toml
+deps.txt`, then `residc file.resid -depmap deps.txt`). `./install.sh` in
+the Resid checkout installs `resid-manifest` beside `residc`.
