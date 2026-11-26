@@ -123,15 +123,27 @@ pub List(Int) mp_str_bytes_at(Str s, Int i, List(Int) acc) {
 
 type MpCp = { Int cp; Int next; };
 
-pub Result(MpCp, SerialError) mp_cp_at(List(Int) bs, Int i, Str what) {
-    if (i >= bs.len()) { return Err(eof_error(what)); }
+pub Result(MpCp, SerialError) mp_cp_at(List(Int) bs, Int i, Str what) { return mp_cp_in(bs, i, bs.len(), what); }
+
+// One code point of a string that ends at `end`, in the one spelling UTF-8
+// allows: no overlong form, no surrogate, nothing past U+10FFFF, and no
+// character that runs past the string's end into what follows it.
+pub Result(MpCp, SerialError) mp_cp_in(List(Int) bs, Int i, Int end, Str what) {
+    if (end > bs.len()) { return mp_cp_in(bs, i, bs.len(), what); }
+    if (i >= end) { return Err(eof_error(what)); }
     Int b0 = bs[i];
     if (b0 < 128) { return Ok(MpCp {.cp = b0, .next = i + 1}); }
     if (b0 < 192) { return Err(syntax_error(f"invalid UTF-8 in {what}: a continuation byte starts it")); }
+    if (b0 < 194 || b0 > 244) { return Err(syntax_error(f"invalid UTF-8 in {what}: byte {b0} never starts a character")); }
     Int extra = if (b0 < 224) { 1 } else { if (b0 < 240) { 2 } else { 3 } };
-    if (i + extra >= bs.len()) { return Err(eof_error(what)); }
+    if (i + extra >= end) { return Err(syntax_error(f"invalid UTF-8 in {what}: a character runs past its end")); }
     Int head = if (extra == 1) { b0 - 192 } else { if (extra == 2) { b0 - 224 } else { b0 - 240 } };
-    return mp_cp_cont(bs, i, extra, 0, head, what);
+    MpCp c = mp_cp_cont(bs, i, extra, 0, head, what)?;
+    Int least = if (extra == 1) { 128 } else { if (extra == 2) { 2048 } else { 65536 } };
+    if (c.cp < least) { return Err(syntax_error(f"invalid UTF-8 in {what}: an overlong form")); }
+    if (c.cp >= 0xD800 && c.cp <= 0xDFFF) { return Err(syntax_error(f"invalid UTF-8 in {what}: a surrogate")); }
+    if (c.cp > 0x10FFFF) { return Err(syntax_error(f"invalid UTF-8 in {what}: past U+10FFFF")); }
+    return Ok(c);
 }
 
 pub Result(MpCp, SerialError) mp_cp_cont(List(Int) bs, Int i, Int extra, Int k, Int cp, Str what) {
@@ -145,7 +157,7 @@ pub Result(Str, SerialError) mp_str_at(List(Int) bs, Int i, Int end, Str what) {
 
 pub Result(Str, SerialError) mp_str_at_buf(List(Int) bs, Int i, Int end, StrBuf b, Str what) {
     if (i >= end) { return Ok(b.finish()); }
-    Result(MpCp, SerialError) r = mp_cp_at(bs, i, what);
+    Result(MpCp, SerialError) r = mp_cp_in(bs, i, end, what);
     if (Err(e) = r) { Str dropped = b.finish(); return Err(e); }
     if (Ok(c) = r) { return mp_str_at_buf(bs, c.next, end, b.push_char(c.cp), what); }
     Str dropped2 = b.finish();
@@ -156,7 +168,7 @@ pub Result(Int, SerialError) mp_cp_count(List(Int) bs, Int i, Int end, Str what)
 
 pub Result(Int, SerialError) mp_cp_count_at(List(Int) bs, Int i, Int end, Int acc, Str what) {
     if (i >= end) { return Ok(acc); }
-    Result(MpCp, SerialError) r = mp_cp_at(bs, i, what);
+    Result(MpCp, SerialError) r = mp_cp_in(bs, i, end, what);
     if (Err(e) = r) { return Err(e); }
     if (Ok(c) = r) { return mp_cp_count_at(bs, c.next, end, acc + 1, what); }
     return Err(custom_error("unreachable"));

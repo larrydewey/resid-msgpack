@@ -133,7 +133,8 @@ Int main() {
     check_text("n/bignum too long", big_err("c902" + str_repeat("00", 17)), "unexpected end of input, expected an extension");
 
     // Text that is not text.
-    check_text("u/truncated sequence", str_err("d901c3"), "unexpected end of input, expected a string");
+    // The string's one byte starts a two-byte character.
+    check_text("u/truncated sequence", str_err("d901c3"), "invalid UTF-8 in a string: a character runs past its end");
     check_text("u/continuation first", str_err("d90280bf"), "invalid UTF-8 in a string: a continuation byte starts it");
     check_text("u/bad continuation", str_err("d902c341"), "invalid UTF-8 in a string");
 

@@ -26,4 +26,10 @@ ok   length/array32
 ok   length/map32
 ok   length/str32
 ok   length/bin32
+ok   utf8/overlong
+ok   utf8/overlong 3
+ok   utf8/surrogate
+ok   utf8/past U+10FFFF
+ok   utf8/past its end
+ok   utf8/four bytes
 exit 0

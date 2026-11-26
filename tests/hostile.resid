@@ -139,5 +139,13 @@ Int main() {
     check_text("length/str32", value_of([0xDB, 0xFF, 0xFF, 0xFF, 0xFF, 0x61]), "unexpected end of input, expected a string");
     check_text("length/bin32", value_of([0xC6, 0xFF, 0xFF, 0xFF, 0xFF, 0x61]), "unexpected end of input, expected bytes");
 
+    // One spelling of each character, inside the string's own bytes.
+    check_text("utf8/overlong", str_of([0xD9, 2, 0xC0, 0xAF]), "invalid UTF-8 in a string: byte 192 never starts a character");
+    check_text("utf8/overlong 3", str_of([0xD9, 3, 0xE0, 0x80, 0xAF]), "invalid UTF-8 in a string: an overlong form");
+    check_text("utf8/surrogate", str_of([0xD9, 3, 0xED, 0xA0, 0x80]), "invalid UTF-8 in a string: a surrogate");
+    check_text("utf8/past U+10FFFF", str_of([0xD9, 4, 0xF4, 0x90, 0x80, 0x80]), "invalid UTF-8 in a string: past U+10FFFF");
+    check_text("utf8/past its end", value_of([0xDC, 0, 2, 0xD9, 1, 0xC3, 0xA9]), "invalid UTF-8 in a string: a character runs past its end");
+    check_text("utf8/four bytes", str_of([0xD9, 4, 0xF0, 0x9F, 0x98, 0x80]), str_from_code(128512));
+
     return 0;
 }

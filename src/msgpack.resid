@@ -655,7 +655,7 @@ Result(Parsed(Int, MsgpackDec), SerialError) md_str_next(MsgpackDec d) {
     MpLeft left = md_left(d, 3);
     if (!left.ok) { return Err(custom_error(left.why)); }
     if (left.n == 0) { return parsed(0 - 1, md_pop(d)); }
-    Result(MpCp, SerialError) r = mp_cp_at(d.in, d.pos, "a string");
+    Result(MpCp, SerialError) r = mp_cp_in(d.in, d.pos, d.pos + left.n, "a string");
     if (Err(e) = r) { return Err(e); }
     if (Ok(c) = r) { return parsed(c.cp, md_set_left(md_take(d, c.next - d.pos), left.n - (c.next - d.pos))); }
     return Err(eof_error("a string"));
