@@ -106,5 +106,16 @@ Int main() {
     check_text("skip/nested", skipping([0xDC, 0, 1, 0xDE, 0, 1, 0xD9, 1, 0x61, 0xDC, 0, 0]), "x = 7");
     check_text("skip/float cut short", skipping([0xCB, 0x3F, 0xF8]), "unexpected end of input, expected a value");
 
+    // The nesting limit.
+    check("depth/limit is 64", msgpack_max_depth() == 64);
+    Result(Value, SerialError) deepest = decode_value(msgpack_decoder(arrays(64)));
+    check_text("depth/64 arrays", err_of(deepest), "ok");
+    check_text("depth/65 arrays", value_of(arrays(65)), "nested deeper than 64 levels");
+    check_text("depth/65 maps", value_of(times([0xDE, 0, 1, 1], 65, ListBuf()).concat([0x01])), "nested deeper than 64 levels");
+    check_text("depth/20000 arrays", value_of(arrays(20000)), "nested deeper than 64 levels");
+    check_text("depth/skipped", skipping(arrays(100)), "nested deeper than 64 levels");
+    Result(Value, SerialError) wider = decode_value(msgpack_decoder_depth(arrays(3000), 5000));
+    check_text("depth/a wider limit", err_of(wider), "ok");
+
     return 0;
 }

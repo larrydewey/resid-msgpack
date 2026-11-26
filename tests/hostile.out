@@ -4,4 +4,11 @@ ok   skip/array
 ok   skip/map
 ok   skip/nested
 ok   skip/float cut short
+ok   depth/limit is 64
+ok   depth/64 arrays
+ok   depth/65 arrays
+ok   depth/65 maps
+ok   depth/20000 arrays
+ok   depth/skipped
+ok   depth/a wider limit
 exit 0

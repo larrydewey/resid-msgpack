@@ -242,42 +242,86 @@ pub Result(Str, SerialError) to_msgpack_hex(T x) {
 // every frame counts down to zero.
 type MpFrame = MpArr(Int) | MpMap(Int) | MpStr(Int) | MpBin(Int);
 
+// The open frames, innermost first: a push, a pop and a change to the top
+// are each O(1), whatever the depth.
+type MpStack = MsNil | MsCons(MsCell);
+type MsCell = { MpFrame top; MpStack below; };
+
 type MsgpackDec = {
     List(Int) in;
     Int pos;
-    List(MpFrame) open;
+    MpStack open;
+    Int depth;         // arrays and maps open, variant maps included
+    Int max_depth;     // how deep they may nest (msgpack_max_depth by default)
     Int payloads;
     Int vmaps;
 };
 
-pub MsgpackDec msgpack_decoder(List(Int) bs) {
-    List(MpFrame) none = [];
-    return MsgpackDec {.in = bs, .pos = 0, .open = none, .payloads = 0, .vmaps = 0};
+/// How deeply arrays and maps may nest in the input `from_msgpack` reads:
+/// 64. One nested deeper is refused with a syntax error ("nested deeper
+/// than 64 levels") as soon as its type byte is read, and skipping an
+/// unknown field counts the same way, so the time and memory a decode
+/// takes stay linear in the input. `msgpack_decoder_depth` sets another
+/// limit.
+pub Int msgpack_max_depth() { return 64; }
+
+pub MsgpackDec msgpack_decoder(List(Int) bs) { return msgpack_decoder_depth(bs, msgpack_max_depth()); }
+
+/// A decoder that allows `max_depth` levels of arrays and maps instead of
+/// `msgpack_max_depth()`.
+pub MsgpackDec msgpack_decoder_depth(List(Int) bs, Int max_depth) {
+    return MsgpackDec {.in = bs, .pos = 0, .open = MsNil, .depth = 0, .max_depth = max_depth, .payloads = 0, .vmaps = 0};
 }
 
-MsgpackDec md_at(MsgpackDec d, Int pos, List(MpFrame) open) { return MsgpackDec {.in = d.in, .pos = pos, .open = open, .payloads = d.payloads, .vmaps = d.vmaps}; }
+MsgpackDec md_at(MsgpackDec d, Int pos, MpStack open) { return MsgpackDec {.in = d.in, .pos = pos, .open = open, .depth = d.depth, .max_depth = d.max_depth, .payloads = d.payloads, .vmaps = d.vmaps}; }
 
-MsgpackDec md_push(MsgpackDec d, MpFrame f) { return md_at(d, d.pos, d.open.concat([f])); }
+MsgpackDec md_depth(MsgpackDec d, Int depth) { return MsgpackDec {.in = d.in, .pos = d.pos, .open = d.open, .depth = depth, .max_depth = d.max_depth, .payloads = d.payloads, .vmaps = d.vmaps}; }
+
+Bool mp_container(MpFrame f) { return match f { MpArr(x) => true, MpMap(x) => true, MpStr(x) => false, MpBin(x) => false }; }
+
+// A str's or a bin's frame on top.
+MsgpackDec md_push(MsgpackDec d, MpFrame f) { return md_at(d, d.pos, MsCons(MsCell {.top = f, .below = d.open})); }
+
+// An array's or a map's frame on top, one level deeper: past the limit it
+// is refused.
+Result(MsgpackDec, SerialError) md_open(MsgpackDec d, MpFrame f) {
+    if (d.depth >= d.max_depth) { return Err(mp_too_deep(d.max_depth)); }
+    return Ok(md_depth(md_push(d, f), d.depth + 1));
+}
+
+SerialError mp_too_deep(Int max_depth) { return syntax_error(f"nested deeper than {max_depth} levels"); }
 
 MsgpackDec md_pop(MsgpackDec d) {
-    Int k = d.open.len();
-    if (k == 0) { return d; }
-    return md_at(d, d.pos, d.open[0..k - 1]);
+    MpStack o = d.open;
+    return match o {
+        MsNil => d,
+        MsCons(c) => md_drop(md_at(d, d.pos, c.below), mp_container(c.top))
+    };
+}
+
+// The state with a frame gone: one level shallower when it was a container.
+MsgpackDec md_drop(MsgpackDec d, Bool container) {
+    if (container) { return md_depth(d, d.depth - 1); }
+    return d;
 }
 
 MsgpackDec md_take(MsgpackDec d, Int n) { return md_at(d, d.pos + n, d.open); }
 
 MsgpackDec md_set_left(MsgpackDec d, Int n) {
-    Int k = d.open.len();
-    if (k == 0) { return d; }
-    MpFrame f = d.open[k - 1];
-    MpFrame moved = match f {
+    MpStack o = d.open;
+    return match o {
+        MsNil => d,
+        MsCons(c) => md_at(d, d.pos, MsCons(MsCell {.top = mp_moved(c.top, n), .below = c.below}))
+    };
+}
+
+MpFrame mp_moved(MpFrame f, Int n) {
+    return match f {
         MpArr(x) => MpArr(n),
         MpMap(x) => MpMap(n),
         MpStr(x) => MpStr(n),
         MpBin(x) => MpBin(n)
     };
-    return md_at(d, d.pos, d.open[0..k - 1].concat([moved]));
 }
 
 // How many parts the top frame has left, when it is the kind the caller
@@ -287,9 +331,14 @@ type MpLeft = { Int n; Bool ok; Str why; };
 MpLeft ml_miss(Str why) { return MpLeft {.n = 0, .ok = false, .why = why}; }
 
 MpLeft md_left(MsgpackDec d, Int kind) {
-    Int k = d.open.len();
-    if (k == 0) { return ml_miss("no container is open"); }
-    MpFrame f = d.open[k - 1];
+    MpStack o = d.open;
+    return match o {
+        MsNil => ml_miss("no container is open"),
+        MsCons(c) => mp_left_of(c.top, kind)
+    };
+}
+
+MpLeft mp_left_of(MpFrame f, Int kind) {
     return match f {
         MpArr(x) => if (kind == 4) { MpLeft {.n = x, .ok = true, .why = ""} } else { ml_miss("no array is open") },
         MpMap(x) => if (kind == 5) { MpLeft {.n = x, .ok = true, .why = ""} } else { ml_miss("no map is open") },
@@ -645,11 +694,11 @@ Result(Parsed(Int, MsgpackDec), SerialError) md_container_begin(MsgpackDec d, In
     Parsed(Int, MsgpackDec) t = md_type(d, what)?;
         if (t.value == two) {
             Parsed(Int, MsgpackDec) n = md_small(t.rest, 2, what)?;
-            return parsed(n.value, md_push(n.rest, if (two == mp_array16()) { MpArr(n.value) } else { MpMap(n.value) }));
+            return parsed(n.value, md_open(n.rest, if (two == mp_array16()) { MpArr(n.value) } else { MpMap(n.value) })?);
         }
         if (t.value == four) {
             Parsed(Int, MsgpackDec) n = md_small(t.rest, 4, what)?;
-            return parsed(n.value, md_push(n.rest, if (two == mp_array16()) { MpArr(n.value) } else { MpMap(n.value) }));
+            return parsed(n.value, md_open(n.rest, if (two == mp_array16()) { MpArr(n.value) } else { MpMap(n.value) })?);
         }
         return Err(invalid_type(what, mp_type_name(t.value)));
 }
@@ -729,9 +778,9 @@ Result(MsgpackDec, SerialError) md_variant_end(MsgpackDec d) {
     return Ok(md_vmaps(md_pop(d), d.vmaps - 1));
 }
 
-MsgpackDec md_payloads(MsgpackDec d, Int n) { return MsgpackDec {.in = d.in, .pos = d.pos, .open = d.open, .payloads = n, .vmaps = d.vmaps}; }
+MsgpackDec md_payloads(MsgpackDec d, Int n) { return MsgpackDec {.in = d.in, .pos = d.pos, .open = d.open, .depth = d.depth, .max_depth = d.max_depth, .payloads = n, .vmaps = d.vmaps}; }
 
-MsgpackDec md_vmaps(MsgpackDec d, Int n) { return MsgpackDec {.in = d.in, .pos = d.pos, .open = d.open, .payloads = d.payloads, .vmaps = n}; }
+MsgpackDec md_vmaps(MsgpackDec d, Int n) { return MsgpackDec {.in = d.in, .pos = d.pos, .open = d.open, .depth = d.depth, .max_depth = d.max_depth, .payloads = d.payloads, .vmaps = n}; }
 
 // ─── Untyped reads ───────────────────────────────────────────────────
 
@@ -769,7 +818,8 @@ Result(MsgpackDec, SerialError) md_skip(MsgpackDec d) { return md_skip_at(d, "a 
 
 // One value of any type, stepped over. A str, a bin, an array or a map is
 // read from its own type byte by the verb that knows its length; an array
-// or a map opens a frame as a read does, and closes it after its items.
+// or a map opens a frame as a read does, so the depth limit holds, and
+// closes it after its items.
 Result(MsgpackDec, SerialError) md_skip_at(MsgpackDec d, Str what) {
     Parsed(Int, MsgpackDec) t = md_type(d, what)?;
         Int k = t.value;
