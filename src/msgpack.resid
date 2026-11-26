@@ -424,16 +424,27 @@ pub Int mp_ext_len(Int b) {
     return 0 - 1;
 }
 
+// The forms with the length in the type byte: fixmap 0x80..0x8f,
+// fixarray 0x90..0x9f, fixstr 0xa0..0xbf. Every other writer uses them for
+// short values, so the decoder reads them though the encoder writes the
+// wider forms.
+Bool mp_is_fixmap(Int b) { return b >= 0x80 && b <= 0x8F; }
+Bool mp_is_fixarray(Int b) { return b >= 0x90 && b <= 0x9F; }
+Bool mp_is_fixstr(Int b) { return b >= 0xA0 && b <= 0xBF; }
+Bool mp_is_str(Int b) { return mp_is_fixstr(b) || b == mp_str8() || b == mp_str16() || b == mp_str32(); }
+Bool mp_is_array(Int b) { return mp_is_fixarray(b) || b == mp_array16() || b == mp_array32(); }
+Bool mp_is_map(Int b) { return mp_is_fixmap(b) || b == mp_map16() || b == mp_map32(); }
+
 Str mp_type_name(Int b) {
     if (b < 0x80) { return "an unsigned integer"; }
     if (b >= 0xE0) { return "a negative integer"; }
     if (b == mp_nil()) { return "null"; }
     if (b == mp_false() || b == mp_true()) { return "a boolean"; }
     if (b == mp_float32() || b == mp_float64()) { return "a float"; }
-    if (b == mp_str8() || b == mp_str16() || b == mp_str32()) { return "a string"; }
+    if (mp_is_str(b)) { return "a string"; }
     if (b == mp_bin8() || b == mp_bin16() || b == mp_bin32()) { return "bytes"; }
-    if (b == mp_array16() || b == mp_array32()) { return "a sequence"; }
-    if (b == mp_map16() || b == mp_map32()) { return "a map"; }
+    if (mp_is_array(b)) { return "a sequence"; }
+    if (mp_is_map(b)) { return "a map"; }
     if (b == mp_uint8() || b == mp_uint16() || b == mp_uint32() || b == mp_uint64()) { return "an unsigned integer"; }
     if (b == mp_int8() || b == mp_int16() || b == mp_int32() || b == mp_int64()) { return "a negative integer"; }
     if (b >= 0xD4 && b <= 0xD8) { return "an extension"; }
@@ -635,19 +646,21 @@ Result(Parsed(Str, MsgpackDec), SerialError) md_str(MsgpackDec d) {
 
 // The length in bytes, from the type byte, with the frame pushed.
 Result(Parsed(Int, MsgpackDec), SerialError) md_str_begin(MsgpackDec d) {
-    Parsed(Int, MsgpackDec) head = md_str_head(d)?;
-    Parsed(Int, MsgpackDec) n = md_small(head.rest, head.value, "a string")?;
+    Parsed(Int, MsgpackDec) n = md_str_len(d)?;
     Int len = n.value;
     if (n.rest.pos + len > n.rest.in.len()) { return Err(eof_error("a string")); }
     Int chars = mp_cp_count(n.rest.in, n.rest.pos, n.rest.pos + len, "a string")?;
     return parsed(chars, md_push(n.rest, MpStr(len)));
 }
 
-Result(Parsed(Int, MsgpackDec), SerialError) md_str_head(MsgpackDec d) {
+// A str's length in bytes: in the type byte for a fixstr, after it for
+// str8, str16 and str32.
+Result(Parsed(Int, MsgpackDec), SerialError) md_str_len(MsgpackDec d) {
     Parsed(Int, MsgpackDec) t = md_type(d, "a string")?;
-        if (t.value == mp_str8()) { return parsed(1, t.rest); }
-        if (t.value == mp_str16()) { return parsed(2, t.rest); }
-        if (t.value == mp_str32()) { return parsed(4, t.rest); }
+        if (mp_is_fixstr(t.value)) { return parsed(t.value - 0xA0, t.rest); }
+        if (t.value == mp_str8()) { return md_small(t.rest, 1, "a string"); }
+        if (t.value == mp_str16()) { return md_small(t.rest, 2, "a string"); }
+        if (t.value == mp_str32()) { return md_small(t.rest, 4, "a string"); }
         return Err(invalid_type("a string", mp_type_name(t.value)));
 }
 
@@ -725,6 +738,9 @@ Result(MsgpackDec, SerialError) md_map_value(MsgpackDec d) { return Ok(d); }
 
 Result(Parsed(Int, MsgpackDec), SerialError) md_container_begin(MsgpackDec d, Int two, Int four, Str what) {
     Parsed(Int, MsgpackDec) t = md_type(d, what)?;
+        Bool array = two == mp_array16();
+        if (array && mp_is_fixarray(t.value)) { return md_container_open(t.rest, t.value - 0x90, true, what); }
+        if (!array && mp_is_fixmap(t.value)) { return md_container_open(t.rest, t.value - 0x80, false, what); }
         if (t.value == two) {
             Parsed(Int, MsgpackDec) n = md_small(t.rest, 2, what)?;
             return md_container_open(n.rest, n.value, two == mp_array16(), what);
@@ -774,8 +790,8 @@ Result(Parsed(Str, MsgpackDec), SerialError) md_variant_name_at(MsgpackDec d) {
             Parsed(MpExt, MsgpackDec) e2 = md_ext_with(d1, t.value)?;
             return md_variant_name_at(e2.rest);
         }
-        if (t.value == mp_str8() || t.value == mp_str16() || t.value == mp_str32()) { return md_str(d); }
-        if (t.value == mp_map16() || t.value == mp_map32()) {
+        if (mp_is_str(t.value)) { return md_str(d); }
+        if (mp_is_map(t.value)) {
             Parsed(Int, MsgpackDec) n = md_container_begin(d, mp_map16(), mp_map32(), "a variant")?;
             Int len = n.value;
             if (len == 0) { return Err(syntax_error("a variant map has no name")); }
@@ -843,6 +859,9 @@ Result(Parsed(Peek, MsgpackDec), SerialError) md_peek_ext(MsgpackDec start, Msgp
 Peek mp_peek_kind(Int b) {
     if (b < 128) { return PeekUInt; }
     if (b >= 0xE0) { return PeekInt; }
+    if (mp_is_fixmap(b)) { return PeekMap; }
+    if (mp_is_fixarray(b)) { return PeekSeq; }
+    if (mp_is_fixstr(b)) { return PeekStr; }
     if (b == mp_nil()) { return PeekNone; }
     if (b == mp_false() || b == mp_true()) { return PeekBool; }
     if (b == mp_float32() || b == mp_float64()) { return PeekFloat; }
@@ -864,15 +883,15 @@ Result(MsgpackDec, SerialError) md_skip(MsgpackDec d) { return md_skip_at(d, "a 
 Result(MsgpackDec, SerialError) md_skip_at(MsgpackDec d, Str what) {
     Parsed(Int, MsgpackDec) t = md_type(d, what)?;
         Int k = t.value;
-        if (k == mp_str8() || k == mp_str16() || k == mp_str32()) { Parsed(Str, MsgpackDec) s = md_str(d)?; return Ok(s.rest); }
+        if (mp_is_str(k)) { Parsed(Str, MsgpackDec) s = md_str(d)?; return Ok(s.rest); }
         if (k == mp_bin8() || k == mp_bin16() || k == mp_bin32()) { Parsed(List(Int), MsgpackDec) s = md_bytes(d)?; return Ok(s.rest); }
         if (k == mp_float64()) { return md_skip_bytes(t.rest, 8, what); }
         if (k == mp_float32()) { return md_skip_bytes(t.rest, 4, what); }
-        if (k == mp_array16() || k == mp_array32()) {
+        if (mp_is_array(k)) {
             Parsed(Int, MsgpackDec) n = md_container_begin(d, mp_array16(), mp_array32(), "an array")?;
             return Ok(md_pop(md_skip_items(n.value, n.rest, "an array item", false)?));
         }
-        if (k == mp_map16() || k == mp_map32()) {
+        if (mp_is_map(k)) {
             Parsed(Int, MsgpackDec) n = md_container_begin(d, mp_map16(), mp_map32(), "a map")?;
             return Ok(md_pop(md_skip_items(n.value, n.rest, "a map entry", true)?));
         }
@@ -880,6 +899,7 @@ Result(MsgpackDec, SerialError) md_skip_at(MsgpackDec d, Str what) {
         if (k >= 0xD0 && k <= 0xD3) { return md_skip_bytes(t.rest, mp_fixed_width(k), what); }
         if (mp_ext_len(k) >= 0) { return md_skip_bytes(t.rest, 1 + mp_ext_len(k), what); }
         if (k == mp_ext8() || k == mp_ext16() || k == mp_ext32()) { return md_skip_ext(t.rest, k); }
+        if (k == 0xC1) { return Err(syntax_error(f"the reserved byte 0xc1 where {what} belongs")); }
         return Ok(t.rest);
 }
 

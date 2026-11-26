@@ -32,4 +32,10 @@ ok   utf8/surrogate
 ok   utf8/past U+10FFFF
 ok   utf8/past its end
 ok   utf8/four bytes
+ok   fix/str
+ok   fix/array
+ok   fix/map
+ok   fix/record
+ok   fix/fields
+ok   fix/reserved c1
 exit 0

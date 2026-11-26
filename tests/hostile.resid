@@ -147,5 +147,12 @@ Int main() {
     check_text("utf8/past its end", value_of([0xDC, 0, 2, 0xD9, 1, 0xC3, 0xA9]), "invalid UTF-8 in a string: a character runs past its end");
     check_text("utf8/four bytes", str_of([0xD9, 4, 0xF0, 0x9F, 0x98, 0x80]), str_from_code(128512));
 
+    // The short forms other writers use: fixstr, fixarray, fixmap.
+    check_text("fix/str", str_of([0xA3, 0x61, 0x62, 0x63]), "abc");
+    check_text("fix/array", value_of([0x93, 1, 2, 3]), "[1u, 2u, 3u]");
+    check_text("fix/map", value_of([0x81, 0xA1, 0x61, 1]), "{\"a\": 1u}");
+    check_text("fix/record", skipping([0x92, 0xA1, 0x61, 0x80]), "x = 7");
+    check_text("fix/fields", str_of([0xA0]), "");
+    check_text("fix/reserved c1", skipping([0xC1]), "the reserved byte 0xc1 where a value belongs");
     return 0;
 }
