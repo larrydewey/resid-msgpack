@@ -575,15 +575,26 @@ Result(Parsed(UInt(128), MsgpackDec), SerialError) md_u128_wide(MsgpackDec d) {
 Result(Parsed(UInt(128), MsgpackDec), SerialError) md_u128_ext(MsgpackDec d, Int b) {
     Parsed(MpExt, MsgpackDec) e2 = md_ext_with(d, b)?;
     if (e2.value.kind == 3) { return Err(invalid_value("a negative bignum", "an unsigned 128-bit integer")); }
-    return parsed(mp_be_value(e2.value.data), e2.rest);
+    UInt(128) mag = mp_bignum_value(e2.value, "an unsigned 128-bit integer")?;
+    return parsed(mag, e2.rest);
 }
 
-// A bignum ext: its data as a magnitude.
+// A bignum ext: its data as a magnitude, which has to fit an Int(128) --
+// 2^127 - 1 for type 2, and the n of -1 - n for type 3.
 Result(Parsed(Int(128), MsgpackDec), SerialError) md_i128_ext(MsgpackDec d, Int b) {
     Parsed(MpExt, MsgpackDec) e2 = md_ext_with(d, b)?;
-    UInt(128) mag = mp_be_value(e2.value.data);
+    UInt(128) mag = mp_bignum_value(e2.value, "a 128-bit integer")?;
+    if (mag > u128(170141183460469231731687303715884105727)) { return Err(invalid_value(f"a bignum of magnitude {mag}", "a 128-bit integer")); }
     if (e2.value.kind == 3) { return parsed(i128(0) - (Int(128))mag - i128(1), e2.rest); }
     return parsed((Int(128))mag, e2.rest);
+}
+
+// The magnitude a bignum ext carries: type 2 or 3, at most 16 bytes. A
+// longer one would lose its high bytes to the shifts.
+Result(UInt(128), SerialError) mp_bignum_value(MpExt x, Str what) {
+    if (x.kind != 2 && x.kind != 3) { return Err(invalid_type(what, f"an extension of type {x.kind}")); }
+    if (x.data.len() > 16) { return Err(invalid_length(x.data.len(), "a bignum of at most 16 bytes")); }
+    return Ok(mp_be_value(x.data));
 }
 
 UInt(128) mp_be_value(List(Int) bs) { return mp_be_value_at(bs, 0, u128(0)); }

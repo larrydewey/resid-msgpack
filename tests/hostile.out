@@ -17,4 +17,9 @@ ok   i128/-2^40
 ok   i128/2^63 as uint64
 ok   i128/below Int
 ok   i128/-2^64
+ok   bignum/2^127 as i128
+ok   bignum/2^127 as u128
+ok   bignum/negative 2^127
+ok   bignum/17 bytes
+ok   bignum/another ext type
 exit 0

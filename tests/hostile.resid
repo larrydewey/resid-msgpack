@@ -125,5 +125,13 @@ Int main() {
     check_text("i128/below Int", i128_trip(i128(0) - i128(9223372036854775807) - i128(6)), "d7038000000000000004 -9223372036854775813");
     check_text("i128/-2^64", i128_trip(i128(0) - i128(18446744073709551616)), "d703ffffffffffffffff -18446744073709551616");
 
+    // A bignum ext past Int(128) or 16 bytes is an error.
+    List(Int) two127 = [0xD8, 2, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    check_text("bignum/2^127 as i128", big_text(from_msgpack(two127)), "invalid value a bignum of magnitude 170141183460469231731687303715884105728, expected a 128-bit integer");
+    check_text("bignum/2^127 as u128", ubig_text(from_msgpack(two127)), "170141183460469231731687303715884105728");
+    check_text("bignum/negative 2^127", value_of([0xD8, 3, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]), "invalid value a bignum of magnitude 170141183460469231731687303715884105728, expected a 128-bit integer");
+    check_text("bignum/17 bytes", ubig_text(from_msgpack([0xC7, 17, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])), "invalid length 17, expected a bignum of at most 16 bytes");
+    check_text("bignum/another ext type", big_text(from_msgpack([0xD4, 5, 1])), "invalid type: expected a 128-bit integer, found an extension of type 5");
+
     return 0;
 }
