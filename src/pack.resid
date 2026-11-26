@@ -181,9 +181,20 @@ pub Result(Int, SerialError) mp_cp_count_at(List(Int) bs, Int i, Int end, Int ac
 // shift the fraction out a bit at a time, which is exact for a value that is
 // already a binary floating-point number.
 
+// 2^n by squaring: one step per bit of n rather than one per unit, since a
+// decoder computes one for every float it reads. Every product is a power
+// of two inside the double range, so each is exact; the base is squared
+// only while bits of n remain, so it never passes 2^1024 or 2^-1024.
 pub Float mp_pow2(Int n) {
-    if (n >= 0) { return mp_pow2_up(n, 1.0); }
-    return mp_pow2_down(0 - n, 1.0);
+    if (n >= 0) { return mp_pow2_sq(n, 2.0, 1.0); }
+    return mp_pow2_sq(0 - n, 0.5, 1.0);
+}
+
+Float mp_pow2_sq(Int n, Float base, Float acc) {
+    if (n == 0) { return acc; }
+    Float acc1 = if ((n & 1) == 1) { acc * base } else { acc };
+    if (n == 1) { return acc1; }
+    return mp_pow2_sq(n >> 1, base * base, acc1);
 }
 
 pub Float mp_pow2_up(Int n, Float acc) {
