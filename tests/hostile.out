@@ -1,0 +1,7 @@
+ok   skip/str
+ok   skip/bin
+ok   skip/array
+ok   skip/map
+ok   skip/nested
+ok   skip/float cut short
+exit 0

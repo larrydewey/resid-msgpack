@@ -767,26 +767,35 @@ Peek mp_peek_kind(Int b) {
 
 Result(MsgpackDec, SerialError) md_skip(MsgpackDec d) { return md_skip_at(d, "a value"); }
 
+// One value of any type, stepped over. A str, a bin, an array or a map is
+// read from its own type byte by the verb that knows its length; an array
+// or a map opens a frame as a read does, and closes it after its items.
 Result(MsgpackDec, SerialError) md_skip_at(MsgpackDec d, Str what) {
     Parsed(Int, MsgpackDec) t = md_type(d, what)?;
         Int k = t.value;
-        if (k == mp_str8() || k == mp_str16() || k == mp_str32()) { Parsed(Str, MsgpackDec) s = md_str(t.rest)?; return Ok(s.rest); }
-        if (k == mp_bin8() || k == mp_bin16() || k == mp_bin32()) { Parsed(List(Int), MsgpackDec) s = md_bytes(t.rest)?; return Ok(s.rest); }
-        if (k == mp_float64()) { return Ok(md_take(t.rest, 8)); }
-        if (k == mp_float32()) { return Ok(md_take(t.rest, 4)); }
+        if (k == mp_str8() || k == mp_str16() || k == mp_str32()) { Parsed(Str, MsgpackDec) s = md_str(d)?; return Ok(s.rest); }
+        if (k == mp_bin8() || k == mp_bin16() || k == mp_bin32()) { Parsed(List(Int), MsgpackDec) s = md_bytes(d)?; return Ok(s.rest); }
+        if (k == mp_float64()) { return md_skip_bytes(t.rest, 8, what); }
+        if (k == mp_float32()) { return md_skip_bytes(t.rest, 4, what); }
         if (k == mp_array16() || k == mp_array32()) {
-            Parsed(Int, MsgpackDec) n = md_container_begin(t.rest, mp_array16(), mp_array32(), "an array")?;
-            return md_skip_items(n.value, n.rest, "an array item", false);
+            Parsed(Int, MsgpackDec) n = md_container_begin(d, mp_array16(), mp_array32(), "an array")?;
+            return Ok(md_pop(md_skip_items(n.value, n.rest, "an array item", false)?));
         }
         if (k == mp_map16() || k == mp_map32()) {
-            Parsed(Int, MsgpackDec) n = md_container_begin(t.rest, mp_map16(), mp_map32(), "a map")?;
-            return md_skip_items(n.value, n.rest, "a map entry", true);
+            Parsed(Int, MsgpackDec) n = md_container_begin(d, mp_map16(), mp_map32(), "a map")?;
+            return Ok(md_pop(md_skip_items(n.value, n.rest, "a map entry", true)?));
         }
-        if (k >= 0xCC && k <= 0xCF) { return Ok(md_take(t.rest, mp_fixed_width(k))); }
-        if (k >= 0xD0 && k <= 0xD3) { return Ok(md_take(t.rest, mp_fixed_width(k))); }
-        if (mp_ext_len(k) >= 0) { return Ok(md_take(t.rest, 1 + mp_ext_len(k))); }
+        if (k >= 0xCC && k <= 0xCF) { return md_skip_bytes(t.rest, mp_fixed_width(k), what); }
+        if (k >= 0xD0 && k <= 0xD3) { return md_skip_bytes(t.rest, mp_fixed_width(k), what); }
+        if (mp_ext_len(k) >= 0) { return md_skip_bytes(t.rest, 1 + mp_ext_len(k), what); }
         if (k == mp_ext8() || k == mp_ext16() || k == mp_ext32()) { return md_skip_ext(t.rest, k); }
         return Ok(t.rest);
+}
+
+// `n` payload bytes, which have to be there.
+Result(MsgpackDec, SerialError) md_skip_bytes(MsgpackDec d, Int n, Str what) {
+    if (d.pos + n > d.in.len()) { return Err(eof_error(what)); }
+    return Ok(md_take(d, n));
 }
 
 Int mp_fixed_width(Int b) {
@@ -799,7 +808,7 @@ Int mp_fixed_width(Int b) {
 Result(MsgpackDec, SerialError) md_skip_ext(MsgpackDec d, Int b) {
     Int w = if (b == mp_ext8()) { 1 } else { if (b == mp_ext16()) { 2 } else { 4 } };
     Parsed(Int, MsgpackDec) n = md_small(d, w, "an extension")?;
-    return Ok(md_take(n.rest, 1 + n.value));
+    return md_skip_bytes(n.rest, 1 + n.value, "an extension");
 }
 
 Result(MsgpackDec, SerialError) md_skip_items(Int left, MsgpackDec d, Str what, Bool pairs) {

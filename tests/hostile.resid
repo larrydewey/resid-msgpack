@@ -1,0 +1,110 @@
+// hostile.resid — bytes an attacker would send, and the round trips that
+// once went wrong. Every check here failed, aborted or took seconds before
+// the fix it pins.
+
+import "../src/msgpack.resid";
+import "resid-serial/value.resid";
+import "check.resid";
+
+// A record with one field, so an unknown field has to be skipped.
+type Pt = { Int x; };
+
+List(Str) pt_fields() { return ["x"]; }
+
+@needs(Decoder(F))
+Result(Parsed(Pt, F), SerialError) dec_pt(F s) {
+    F s0 = read_struct_begin(s, "Pt", pt_fields())?;
+    return dec_pt_at(s0, None);
+}
+Decode(Pt, F) = dec_pt;
+
+@needs(Decoder(F))
+Result(Parsed(Pt, F), SerialError) dec_pt_at(F s, Option(Int) x) {
+    Parsed(FieldKey, F) k = read_field(s, pt_fields())?;
+    FieldKey key = k.value;
+    return match key {
+        KnownField(i) => dec_pt_slot(k.rest, x),
+        UnknownField(name) => dec_pt_at(skip_unknown(k.rest, name, pt_fields(), false)?, x),
+        EndOfFields => dec_pt_end(k.rest, x)
+    };
+}
+
+@needs(Decoder(F))
+Result(Parsed(Pt, F), SerialError) dec_pt_slot(F s, Option(Int) x) {
+    Parsed(Option(Int), F) v = read_slot(s, x, "x")?;
+    return dec_pt_at(v.rest, v.value);
+}
+
+Result(Parsed(Pt, F), SerialError) dec_pt_end(F s, Option(Int) x) {
+    Int xv = require(x, "x")?;
+    return parsed(Pt {.x = xv}, s);
+}
+
+// {"y": <value>, "x": 7}, the map and keys in the wide forms the encoder
+// writes.
+Str skipping(List(Int) value) {
+    List(Int) bs = [0xDE, 0, 2, 0xD9, 1, 0x79].concat(value).concat([0xD9, 1, 0x78, 7]);
+    Result(Pt, SerialError) r = from_msgpack(bs);
+    if (Err(e) = r) { return error_text(e); }
+    if (Ok(p) = r) { return f"x = {p.x}"; }
+    return "unreachable";
+}
+
+// `x` repeated n times.
+List(Int) times(List(Int) x, Int n, ListBuf(Int) b) {
+    if (n <= 0) { return b.finish(); }
+    return times(x, n - 1, push_all(b, x, 0));
+}
+
+ListBuf(Int) push_all(ListBuf(Int) b, List(Int) x, Int i) {
+    if (i >= x.len()) { return b; }
+    return push_all(b.push(x[i]), x, i + 1);
+}
+
+// n arrays of one element, around a 1.
+List(Int) arrays(Int n) { return times([0xDC, 0, 1], n, ListBuf()).concat([0x01]); }
+
+// The message of a failed Value decode without its path, or what it shows.
+Str value_of(List(Int) bs) {
+    Result(Value, SerialError) r = from_msgpack(bs);
+    if (Err(e) = r) { return e.msg; }
+    if (Ok(v) = r) { return show_value(v); }
+    return "unreachable";
+}
+
+Str str_of(List(Int) bs) {
+    Result(Str, SerialError) r = from_msgpack(bs);
+    if (Err(e) = r) { return e.msg; }
+    if (Ok(s) = r) { return s; }
+    return "unreachable";
+}
+
+Str int_trip(Int v) {
+    Result(List(Int), SerialError) bs = to_msgpack(v);
+    if (Err(e) = bs) { return error_text(e); }
+    if (Ok(b) = bs) {
+        Result(Int, SerialError) back = from_msgpack(b);
+        if (Err(e) = back) { return msgpack_to_hex(b) + " " + error_text(e); }
+        if (Ok(n) = back) { return msgpack_to_hex(b) + f" {n}"; }
+    }
+    return "unreachable";
+}
+
+Str i128_trip(Int(128) v) {
+    Result(List(Int), SerialError) bs = to_msgpack(v);
+    if (Err(e) = bs) { return error_text(e); }
+    if (Ok(b) = bs) { return msgpack_to_hex(b) + " " + big_text(from_msgpack(b)); }
+    return "unreachable";
+}
+
+Int main() {
+    // Skipping an unknown field reads each value from its own type byte.
+    check_text("skip/str", skipping([0xD9, 2, 0x61, 0x62]), "x = 7");
+    check_text("skip/bin", skipping([0xC4, 2, 1, 2]), "x = 7");
+    check_text("skip/array", skipping([0xDC, 0, 2, 1, 2]), "x = 7");
+    check_text("skip/map", skipping([0xDE, 0, 1, 0xD9, 1, 0x61, 1]), "x = 7");
+    check_text("skip/nested", skipping([0xDC, 0, 1, 0xDE, 0, 1, 0xD9, 1, 0x61, 0xDC, 0, 0]), "x = 7");
+    check_text("skip/float cut short", skipping([0xCB, 0x3F, 0xF8]), "unexpected end of input, expected a value");
+
+    return 0;
+}
