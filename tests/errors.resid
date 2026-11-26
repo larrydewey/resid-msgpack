@@ -97,7 +97,8 @@ Str big_err(Str text) {
 Int main() {
     // Nothing at all, and nothing after.
     check_text("e/empty", int_err(""), "unexpected end of input, expected an integer");
-    check_text("e/array eof", list_err("dc00030102"), "unexpected end of input, expected an integer at [2]");
+    // Three items cannot fit in the two bytes left, so the count is refused.
+    check_text("e/array eof", list_err("dc00030102"), "unexpected end of input, expected a sequence");
     check_text("e/string eof", str_err("d9044945"), "unexpected end of input, expected a string");
     check_text("e/struct eof", point_err("de0001d9017801"), "missing field `y`");
     check_text("e/trailing", int_err("0101"), "trailing input after the value: 1 byte(s)");

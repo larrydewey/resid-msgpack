@@ -133,5 +133,11 @@ Int main() {
     check_text("bignum/17 bytes", ubig_text(from_msgpack([0xC7, 17, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])), "invalid length 17, expected a bignum of at most 16 bytes");
     check_text("bignum/another ext type", big_text(from_msgpack([0xD4, 5, 1])), "invalid type: expected a 128-bit integer, found an extension of type 5");
 
+    // A count or a length past the bytes left is refused at its head.
+    check_text("length/array32", value_of([0xDD, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]), "unexpected end of input, expected a sequence");
+    check_text("length/map32", value_of([0xDF, 0xFF, 0xFF, 0xFF, 0xFF, 0x01]), "unexpected end of input, expected a map");
+    check_text("length/str32", value_of([0xDB, 0xFF, 0xFF, 0xFF, 0xFF, 0x61]), "unexpected end of input, expected a string");
+    check_text("length/bin32", value_of([0xC6, 0xFF, 0xFF, 0xFF, 0xFF, 0x61]), "unexpected end of input, expected bytes");
+
     return 0;
 }

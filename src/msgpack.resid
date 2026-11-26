@@ -638,6 +638,7 @@ Result(Parsed(Int, MsgpackDec), SerialError) md_str_begin(MsgpackDec d) {
     Parsed(Int, MsgpackDec) head = md_str_head(d)?;
     Parsed(Int, MsgpackDec) n = md_small(head.rest, head.value, "a string")?;
     Int len = n.value;
+    if (n.rest.pos + len > n.rest.in.len()) { return Err(eof_error("a string")); }
     Int chars = mp_cp_count(n.rest.in, n.rest.pos, n.rest.pos + len, "a string")?;
     return parsed(chars, md_push(n.rest, MpStr(len)));
 }
@@ -672,6 +673,7 @@ Result(Parsed(Int, MsgpackDec), SerialError) md_bytes_begin(MsgpackDec d) {
     Parsed(Int, MsgpackDec) head = md_bin_head(d)?;
     Parsed(Int, MsgpackDec) n = md_small(head.rest, head.value, "bytes")?;
     Int len = n.value;
+    if (n.rest.pos + len > n.rest.in.len()) { return Err(eof_error("bytes")); }
     return parsed(len, md_push(n.rest, MpBin(len)));
 }
 
@@ -725,13 +727,21 @@ Result(Parsed(Int, MsgpackDec), SerialError) md_container_begin(MsgpackDec d, In
     Parsed(Int, MsgpackDec) t = md_type(d, what)?;
         if (t.value == two) {
             Parsed(Int, MsgpackDec) n = md_small(t.rest, 2, what)?;
-            return parsed(n.value, md_open(n.rest, if (two == mp_array16()) { MpArr(n.value) } else { MpMap(n.value) })?);
+            return md_container_open(n.rest, n.value, two == mp_array16(), what);
         }
         if (t.value == four) {
             Parsed(Int, MsgpackDec) n = md_small(t.rest, 4, what)?;
-            return parsed(n.value, md_open(n.rest, if (two == mp_array16()) { MpArr(n.value) } else { MpMap(n.value) })?);
+            return md_container_open(n.rest, n.value, two == mp_array16(), what);
         }
         return Err(invalid_type(what, mp_type_name(t.value)));
+}
+
+// A container of `n` parts opened. Every part is at least a byte, so a
+// count past the bytes left cannot be satisfied: it is refused here,
+// before a caller sizes anything by it.
+Result(Parsed(Int, MsgpackDec), SerialError) md_container_open(MsgpackDec d, Int n, Bool array, Str what) {
+    if (n > d.in.len() - d.pos) { return Err(eof_error(what)); }
+    return parsed(n, md_open(d, if (array) { MpArr(n) } else { MpMap(n) })?);
 }
 
 // ─── Structs ─────────────────────────────────────────────────────────

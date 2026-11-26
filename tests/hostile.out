@@ -22,4 +22,8 @@ ok   bignum/2^127 as u128
 ok   bignum/negative 2^127
 ok   bignum/17 bytes
 ok   bignum/another ext type
+ok   length/array32
+ok   length/map32
+ok   length/str32
+ok   length/bin32
 exit 0
