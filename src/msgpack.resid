@@ -97,9 +97,9 @@ Result(MsgpackEnc, SerialError) me_i128(MsgpackEnc e, Int(128) v) {
         if (u <= u128(18446744073709551615)) { return me_uint(e, (UInt(64))u); }
         return Ok(mp_push_all(e, mp_bignum(false, u), 0));
     }
-    UInt(128) mag = mp_mag128(v);
-    if (mag < u128(18446744073709551615)) { return me_int(e, 0 - (Int)mag - 1); }
-    return Ok(mp_push_all(e, mp_bignum(true, mag), 0));
+    // int64 reaches down to -2^63; below that the ext carries it.
+    if (v >= i128(0) - i128(9223372036854775807) - i128(1)) { return me_int(e, (Int)v); }
+    return Ok(mp_push_all(e, mp_bignum(true, mp_mag128(v)), 0));
 }
 
 Result(MsgpackEnc, SerialError) me_u128(MsgpackEnc e, UInt(128) v) {
@@ -464,7 +464,8 @@ Result(Parsed(Int, MsgpackDec), SerialError) md_int(MsgpackDec d) {
         if (t.value == mp_uint16()) { return md_small(t.rest, 2, "an integer"); }
         if (t.value == mp_uint32()) { return md_small(t.rest, 4, "an integer"); }
         if (t.value == mp_int8() || t.value == mp_int16() || t.value == mp_int32()) { return md_signed(t.rest, mp_fixed_width(t.value), "an integer"); }
-        if (t.value == mp_uint64() || t.value == mp_int64()) { return md_int64(t.rest); }
+        if (t.value == mp_uint64()) { return md_int64(t.rest); }
+        if (t.value == mp_int64()) { return md_int64_signed(t.rest); }
         return Err(invalid_type("an integer", mp_type_name(t.value)));
 }
 
@@ -477,8 +478,20 @@ Result(Parsed(Int, MsgpackDec), SerialError) md_signed(MsgpackDec d, Int n, Str 
     return parsed(signed, v.rest);
 }
 
-// A 64-bit payload read as Int: the wide unsigned forms above Int's range
-// are an error, not a wrap.
+// An int64 payload: eight bytes of two's complement.
+Result(Parsed(Int, MsgpackDec), SerialError) md_int64_signed(MsgpackDec d) {
+    Parsed(UInt(64), MsgpackDec) w = md_wide(d, 8, "an integer")?;
+    return parsed(mp_signed64(w.value), w.rest);
+}
+
+// Eight bytes read as an unsigned number, carried into the sign range.
+Int mp_signed64(UInt(64) w) {
+    if (w <= u64(9223372036854775807)) { return (Int)w; }
+    return (Int)((Int(128))w - i128(18446744073709551616));
+}
+
+// A uint64 payload read as Int: past Int's range it is an error, not a
+// wrap.
 Result(Parsed(Int, MsgpackDec), SerialError) md_int64(MsgpackDec d) {
     Parsed(UInt(64), MsgpackDec) w = md_wide(d, 8, "an integer")?;
     if (w.value > u64(9223372036854775807)) { return Err(invalid_value(f"{w.value}", "an Int")); }
@@ -508,7 +521,8 @@ Result(Parsed(Int(128), MsgpackDec), SerialError) md_i128(MsgpackDec d) {
         if (t.value == mp_uint16()) { return md_i128_small(t.rest, 2); }
         if (t.value == mp_uint32()) { return md_i128_small(t.rest, 4); }
         if (t.value == mp_int8() || t.value == mp_int16() || t.value == mp_int32()) { return md_i128_signed(t.rest, mp_fixed_width(t.value)); }
-        if (t.value == mp_uint64() || t.value == mp_int64()) { return md_i128_wide(t.rest); }
+        if (t.value == mp_uint64()) { return md_i128_wide(t.rest); }
+        if (t.value == mp_int64()) { return md_i128_signed64(t.rest); }
         if (mp_ext_len(t.value) >= 0 || t.value == mp_ext8() || t.value == mp_ext16() || t.value == mp_ext32()) { return md_i128_ext(t.rest, t.value); }
         return Err(invalid_type("a 128-bit integer", mp_type_name(t.value)));
 }
@@ -523,10 +537,16 @@ Result(Parsed(Int(128), MsgpackDec), SerialError) md_i128_small(MsgpackDec d, In
     return parsed((Int(128))v.value, v.rest);
 }
 
+// uint64 and int64 carry the same eight bytes and mean different numbers:
+// past 2^63 - 1 the first is that large, the second negative.
 Result(Parsed(Int(128), MsgpackDec), SerialError) md_i128_wide(MsgpackDec d) {
     Parsed(UInt(64), MsgpackDec) w = md_wide(d, 8, "a 128-bit integer")?;
-    if (w.value <= u64(9223372036854775807)) { return parsed((Int(128))w.value, w.rest); }
-    return parsed(i128(0) - (Int(128))w.value, w.rest);
+    return parsed((Int(128))w.value, w.rest);
+}
+
+Result(Parsed(Int(128), MsgpackDec), SerialError) md_i128_signed64(MsgpackDec d) {
+    Parsed(UInt(64), MsgpackDec) w = md_wide(d, 8, "a 128-bit integer")?;
+    return parsed((Int(128))mp_signed64(w.value), w.rest);
 }
 
 // Unsigned: the plain unsigned forms, or a bignum ext (type 2). A negative

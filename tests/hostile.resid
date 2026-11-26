@@ -117,5 +117,13 @@ Int main() {
     Result(Value, SerialError) wider = decode_value(msgpack_decoder_depth(arrays(3000), 5000));
     check_text("depth/a wider limit", err_of(wider), "ok");
 
+    // int64 is signed and uint64 is not, and both round-trip.
+    check_text("int/-2^40", int_trip(0 - 1099511627776), "d3ffffff0000000000 -1099511627776");
+    check_text("int/Int min", int_trip(0 - 9223372036854775807 - 1), "d38000000000000000 -9223372036854775808");
+    check_text("i128/-2^40", i128_trip(i128(0) - i128(1099511627776)), "d3ffffff0000000000 -1099511627776");
+    check_text("i128/2^63 as uint64", big_text(from_msgpack([0xCF, 0x80, 0, 0, 0, 0, 0, 0, 0])), "9223372036854775808");
+    check_text("i128/below Int", i128_trip(i128(0) - i128(9223372036854775807) - i128(6)), "d7038000000000000004 -9223372036854775813");
+    check_text("i128/-2^64", i128_trip(i128(0) - i128(18446744073709551616)), "d703ffffffffffffffff -18446744073709551616");
+
     return 0;
 }

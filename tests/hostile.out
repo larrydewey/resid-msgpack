@@ -11,4 +11,10 @@ ok   depth/65 maps
 ok   depth/20000 arrays
 ok   depth/skipped
 ok   depth/a wider limit
+ok   int/-2^40
+ok   int/Int min
+ok   i128/-2^40
+ok   i128/2^63 as uint64
+ok   i128/below Int
+ok   i128/-2^64
 exit 0
